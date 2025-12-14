@@ -1360,7 +1360,61 @@ if st.session_state.get("question"):
     with tabs[6]:
         st.markdown("### Diagnostics")
         st.code(json.dumps(diag, ensure_ascii=False, indent=2), language="json")
-# -------------------- Step 7 Manuscript draft --------------------
+
+    
+    # -------------------- Step 6b ROB2 --------------------
+    with tabs[7]:
+        st.markdown("### Step 6b：ROB 2.0（需理由；可人工修正）")
+        if df is None or df.empty:
+            st.info("沒有 records。")
+        else:
+            include_ids = [rid for rid in df["record_id"].tolist() if compute_effective_decision(rid) == "Include"]
+            cands = df[df["record_id"].isin(include_ids)].copy()
+
+            if cands.empty:
+                st.warning("目前沒有 Effective=Include 的研究；請先在 Step 4 進行 override。")
+            else:
+                st.caption("ROB 2.0 建議在納入後做。此處要求：每個 domain + overall 都要填等級與理由。")
+
+                for _, r in cands.iterrows():
+                    rid = r["record_id"]
+                    title = r.get("title","")
+                    rob = st.session_state["rob2"].get(rid) or rob2_default()
+                    st.session_state["rob2"][rid] = rob  # ensure exists
+
+                    with st.expander(f"{rid}｜{short(title, 110)}", expanded=False):
+                        st.markdown("<div class='card'><b>ROB 2.0 評估</b><br><span class='small'>每個 domain 與 overall 都需填理由（可引用文中資訊；若不確定請寫明『不確定』並列需查核點）。</span></div>", unsafe_allow_html=True)
+
+                        for key, label in ROB_DOMAINS:
+                            col1, col2 = st.columns([0.3, 0.7])
+                            with col1:
+                                rob[key] = st.selectbox(label, options=ROB_LEVELS, index=ROB_LEVELS.index(rob.get(key,"NA") if rob.get(key,"NA") in ROB_LEVELS else "NA"), key=f"rob_{rid}_{key}")
+                            with col2:
+                                rob[f"{key}_reason"] = st.text_area("理由", value=rob.get(f"{key}_reason",""), height=85, key=f"rob_{rid}_{key}_rs")
+
+                        st.markdown("<hr class='hr'/>", unsafe_allow_html=True)
+                        col1, col2 = st.columns([0.3, 0.7])
+                        with col1:
+                            rob["overall"] = st.selectbox("Overall ROB", options=ROB_LEVELS, index=ROB_LEVELS.index(rob.get("overall","NA") if rob.get("overall","NA") in ROB_LEVELS else "NA"), key=f"rob_{rid}_overall")
+                        with col2:
+                            rob["overall_reason"] = st.text_area("Overall 理由", value=rob.get("overall_reason",""), height=90, key=f"rob_{rid}_overall_rs")
+
+                        ok, missing = rob2_is_complete(rob)
+                        if ok:
+                            st.success("ROB 2.0 已填完整（含理由）。")
+                        else:
+                            st.markdown(f"<span class='red'>尚未完整：</span>{'；'.join(missing)}", unsafe_allow_html=True)
+
+                # Export ROB2 table
+                export_rows = []
+                for rid in include_ids:
+                    rob = st.session_state["rob2"].get(rid) or rob2_default()
+                    export_rows.append({"record_id": rid, **rob})
+                rob_df = pd.DataFrame(export_rows)
+                st.download_button("下載 ROB 2.0（CSV）", data=to_csv_bytes(rob_df), file_name="rob2.csv", mime="text/csv")
+
+    
+    # -------------------- Step 7 Manuscript draft --------------------
     with tabs[8]:
         st.markdown("### Step 7：稿件草稿（分段呈現；可 BYOK 生成）")
         st.caption("未能自動推論或需要你補的地方會用『』占位；請務必人工核對與改寫。")
