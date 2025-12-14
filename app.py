@@ -1360,8 +1360,126 @@ if st.session_state.get("question"):
     with tabs[6]:
         st.markdown("### Diagnostics")
         st.code(json.dumps(diag, ensure_ascii=False, indent=2), language="json")
+ # -------------------- Step 6 MA + Forest --------------------
+    with tabs[6]:
+        st.markdown("### Step 6：MA + 森林圖（RevMan-like）")
+        ex = st.session_state.get("extract_df", pd.DataFrame())
+        if ex is None or ex.empty:
+            st.info("尚未建立 extraction 寬表。")
+        else:
+            dfm = ex.copy()
+            ensure_columns(dfm, ["Outcome_label","Effect_measure","Effect","Lower_CI","Upper_CI","Timepoint"], "")
+            for c in ["Effect","Lower_CI","Upper_CI"]:
+                dfm[c] = pd.to_numeric(dfm[c], errors="coerce")
 
-    
+            dfm["Outcome_label"] = dfm["Outcome_label"].astype(str).str.strip()
+            dfm["Effect_measure"] = dfm["Effect_measure"].astype(str).str.strip()
+
+            # outcome input
+            available_outcomes = sorted([x for x in dfm["Outcome_label"].unique().tolist() if x])
+            if not available_outcomes:
+                st.warning("你尚未在寬表填入 Outcome_label。仍可先繼續，但 MA 需要至少一個 outcome 命名一致。")
+                available_outcomes = ["(未命名 outcome)"]
+                dfm.loc[dfm["Outcome_label"] == "", "Outcome_label"] = "(未命名 outcome)"
+
+            st.caption("Outcome_label 請在寬表統一命名；下方手動輸入用於選取。")
+            default_outcome = st.session_state.get("ma_outcome_input") or available_outcomes[0]
+            chosen_outcome = st.text_input("Outcome_label（手動輸入/可貼上）", value=default_outcome, key="ma_outcome_input").strip()
+            if not chosen_outcome:
+                chosen_outcome = available_outcomes[0]
+
+            sub = dfm[dfm["Outcome_label"] == chosen_outcome].copy()
+            if sub.empty:
+                st.warning("找不到你輸入的 Outcome_label 對應列。請確認拼字（含空白/大小寫）。")
+                st.stop()
+
+            measures = sorted([m for m in sub["Effect_measure"].unique().tolist() if m])
+            if not measures:
+                st.warning("該 outcome 尚未填 Effect_measure。")
+                st.stop()
+
+            prev_meas = st.session_state.get("ma_measure_choice") or measures[0]
+            if prev_meas not in measures:
+                prev_meas = measures[0]
+            chosen_measure = st.selectbox("選擇 effect measure", options=measures, index=measures.index(prev_meas), key="ma_measure_choice")
+            sub = sub[sub["Effect_measure"] == chosen_measure].copy()
+
+            # validate and build list
+            studies, eff_os, lcl_os, ucl_os, effects_t, ses = [], [], [], [], [], []
+            skipped = []
+
+            for _, r in sub.iterrows():
+                title = str(r.get("title","") or "")
+                year = str(r.get("year","") or "")
+                label = f"{short(title, 60)} ({year})"
+
+                try:
+                    eff = float(r["Effect"])
+                    lcl = float(r["Lower_CI"])
+                    ucl = float(r["Upper_CI"])
+                except Exception:
+                    skipped.append({"study": label, "reason": "Effect/CI 非數字或缺失"})
+                    continue
+
+                se, err = se_from_ci_safe(eff, lcl, ucl, chosen_measure)
+                if err:
+                    skipped.append({"study": label, "effect": eff, "lcl": lcl, "ucl": ucl, "reason": err})
+                    continue
+
+                studies.append(label)
+                eff_os.append(eff); lcl_os.append(lcl); ucl_os.append(ucl)
+                effects_t.append(transform_effect(eff, chosen_measure))
+                ses.append(se)
+
+            if skipped:
+                st.markdown("<div class='card'><span class='badge badge-warn'>已跳過不合法列</span> "
+                            "<span class='red'>這些列不會納入 MA（避免整段消失）。</span></div>", unsafe_allow_html=True)
+                st.dataframe(pd.DataFrame(skipped), use_container_width=True, height=220)
+
+            if len(studies) < 2:
+                st.error("可用研究數 < 2（扣除不合法列後）。請修正 CI/measure 或補齊更多研究。")
+                st.stop()
+
+            res = pool_fixed_random(effects_t, ses)
+            model = st.radio("模型", options=["Fixed effect", "Random effects (DL)"], horizontal=True, key="ma_model_choice")
+
+            if model.startswith("Fixed"):
+                theta = res["fixed"]["theta"]
+                lth, uth = res["fixed"]["lcl"], res["fixed"]["ucl"]
+                w = res["w_fixed"]
+                model_label = "Fixed"
+            else:
+                theta = res["random"]["theta"]
+                lth, uth = res["random"]["lcl"], res["random"]["ucl"]
+                # approximate RE weights for display
+                tau2 = res["random"]["tau2"]
+                w = [1.0/(se*se + tau2) for se in ses]
+                model_label = "Random"
+
+            pe = inverse_transform(theta, chosen_measure)
+            pl = inverse_transform(lth, chosen_measure)
+            pu = inverse_transform(uth, chosen_measure)
+
+            I2 = res["heterogeneity"]["I2"]
+            Q = res["heterogeneity"]["Q"]
+            tau2 = res["random"]["tau2"]
+
+            c1, c2, c3, c4 = st.columns(4)
+            with c1: st.metric("Studies (k)", res["k"])
+            with c2: st.metric("I² (%)", f"{I2:.1f}")
+            with c3: st.metric("Q", f"{Q:.2f}")
+            with c4: st.metric("tau²", f"{tau2:.4f}")
+
+            st.markdown(f"**Pooled effect ({model_label}, {chosen_measure})**：`{pe:.4f}`（95% CI `{pl:.4f}`–`{pu:.4f}`）")
+
+            # RevMan-like forest plot
+            if HAS_PLOTLY:
+                fig = forest_revman_plotly(studies, eff_os, lcl_os, ucl_os, w, (pe, pl, pu), chosen_measure, model_label)
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("環境缺少 Plotly：改以表格顯示森林圖資料。")
+                st.dataframe(pd.DataFrame({"study": studies, "effect": eff_os, "lcl": lcl_os, "ucl": ucl_os, "weight": w}), use_container_width=True)
+
     # -------------------- Step 6b ROB2 --------------------
     with tabs[7]:
         st.markdown("### Step 6b：ROB 2.0（需理由；可人工修正）")
@@ -1413,7 +1531,6 @@ if st.session_state.get("question"):
                 rob_df = pd.DataFrame(export_rows)
                 st.download_button("下載 ROB 2.0（CSV）", data=to_csv_bytes(rob_df), file_name="rob2.csv", mime="text/csv")
 
-    
     # -------------------- Step 7 Manuscript draft --------------------
     with tabs[8]:
         st.markdown("### Step 7：稿件草稿（分段呈現；可 BYOK 生成）")
