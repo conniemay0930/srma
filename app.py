@@ -277,21 +277,39 @@ def call_openai_compatible(messages: List[Dict[str, str]], max_tokens: int = 140
 # =========================================================
 with st.sidebar:
     st.header("設定")
-    st.subheader("LLM（使用者自備 key）")
-    st.checkbox("啟用 LLM（BYOK）", key="byok_enabled")
-    st.session_state["byok_consent"] = st.checkbox(
-        "我理解並同意：僅供學術用途；輸出需人工核對；不輸入病人資訊；不違反校內授權。",
-        value=bool(st.session_state.get("byok_consent", False)),
-    )
-    st.text_input("Base URL（OpenAI-compatible）", key="byok_base_url")
-    st.text_input("Model", key="byok_model")
-    st.text_input("API Key（只在本次 session）", type="password", key="byok_key")
-    st.slider("Temperature", 0.0, 1.0, 0.2, 0.05, key="byok_temp")
-    st.button("Clear key", on_click=lambda: st.session_state.update({"byok_key": ""}))
+
+    st.selectbox("Language（顯示）", options=["繁體中文", "English"], key="lang")
 
     st.markdown("---")
-    st.subheader("顯示選項")
-    st.checkbox("逐篇卡片顯示（推薦）", value=True, key="show_record_cards")
+    st.subheader("LLM（使用者自備 key）")
+
+    st.checkbox("啟用 LLM（BYOK）", key="byok_enabled", help="預設關閉；關閉時流程自動降級，不會卡住。")
+
+    st.caption("Key only used for this session; do not use on untrusted deployments; do not upload identifiable patient info.")
+
+    st.text_input("Base URL（OpenAI-compatible）", key="byok_base_url", help="例如 https://api.openai.com/v1")
+    st.text_input("Model", key="byok_model")
+    st.text_input("API Key（只在本次 session）", type="password", key="byok_key")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.button("Clear key", on_click=lambda: st.session_state.update({"byok_key": ""}))
+    with c2:
+        st.slider("Temperature", 0.0, 1.0, 0.2, 0.05, key="byok_temp")
+
+    st.markdown("---")
+    st.subheader("寫作範本（可選，DOCX）")
+    st.caption("可上傳你自己的稿件範本用於「語調提示」。請確認你擁有使用權。")
+    tmpl_files = st.file_uploader("上傳 DOCX（可多份）", type=["docx"], accept_multiple_files=True)
+
+    st.markdown("---")
+    st.subheader("使用提醒")
+    st.markdown(
+        "- 建議輸入一句清楚問題（含介入/比較與族群）\n"
+        "- 若只有縮寫（如 EDOF），請盡量補上完整詞或 lens 名稱\n"
+        "- 沒有 key 也可跑到搜尋式/抓文獻/PRISMA/寬表/MA（前提：寬表有 Effect/CI）\n"
+        "- ROB 2.0 與納入標準仍需人工把關"
+    )
 
 
 # =========================================================
