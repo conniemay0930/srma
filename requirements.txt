@@ -1,5 +1,6 @@
-streamlit
-requests
-pandas
+streamlit>=1.35
+requests>=2.31
+pandas>=2.0
+plotly>=5.22
 openai
 google-generativeai
