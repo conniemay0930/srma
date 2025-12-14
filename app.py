@@ -82,7 +82,7 @@ st.markdown(CSS, unsafe_allow_html=True)
 
 # -------------------- Header --------------------
 st.title("一句話帶你完成 MA")
-st.caption("作者：Ya Hsin Yao　|　Language：繁體中文　|　免責聲明：僅供學術用途；請自行驗證所有結果與引用。")
+st.caption("作者：Ya Hsin Yao　|　免責聲明：僅供學術用途；請自行驗證所有結果與引用。")
 
 st.markdown(
     "<div class='notice'>"
