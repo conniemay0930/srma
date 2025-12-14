@@ -1649,3 +1649,131 @@ if st.session_state.get("question"):
     with tabs[9]:
         st.markdown("### Diagnostics")
         st.code(json.dumps(diag, ensure_ascii=False, indent=2), language="json")
+        # =========================
+# Outputs (persistent)
+# =========================
+st.header(t("outputs"))
+
+prot = st.session_state.get("protocol") or {}
+pub_q = st.session_state.get("pubmed_query","")
+df = st.session_state.get("records", safe_empty_records_df().iloc[:0].copy())
+scr = st.session_state.get("screening", pd.DataFrame())
+scan = st.session_state.get("srma_scan", {"summary":"", "hits": pd.DataFrame()})
+wide = st.session_state.get("extraction_wide", pd.DataFrame())
+ma = st.session_state.get("ma_result")
+diag = st.session_state.get("diag", {}) or {}
+
+colA, colB = st.columns([2,1])
+with colA:
+    st.subheader(t("protocol"))
+    st.code(json.dumps(prot, ensure_ascii=False, indent=2), language="json")
+with colB:
+    st.subheader(t("pubmed_query"))
+    st.code(pub_q or "", language="text")
+
+st.subheader(t("diagnostics"))
+with st.expander(t("show_diag")):
+    st.write({"pubmed_total_count": int(st.session_state.get("pubmed_total") or 0)})
+    st.write(diag)
+
+if st.session_state.get("include_srma_scan", True) and scan and scan.get("summary"):
+    st.subheader(t("srma_title"))
+    st.info(scan["summary"])
+    hits = scan.get("hits", pd.DataFrame())
+    if isinstance(hits, pd.DataFrame) and not hits.empty:
+        st.dataframe(hits, use_container_width=True)
+        st.download_button(t("download_csv"), data=to_csv_bytes(hits), file_name="srma_nma_hits.csv")
+
+st.subheader(t("records"))
+if isinstance(df, pd.DataFrame) and df.empty:
+    st.info(t("no_records"))
+else:
+    merged = df.merge(scr, on="record_id", how="left")
+    merged = ensure_cols(merged, ["AI_label","AI_reason","AI_confidence"], "")
+    merged["TA_final"] = merged["record_id"].map(lambda rid: st.session_state["ta_final"].get(rid, t("ta_unsure")))
+    merged["FT_decision"] = merged["record_id"].map(lambda rid: st.session_state["ft_decision"].get(rid, t("ft_not")))
+    merged["FT_reason"] = merged["record_id"].map(lambda rid: st.session_state["ft_reason"].get(rid, ""))
+
+    st.dataframe(
+        merged[["record_id","year","first_author","title","AI_label","AI_reason","TA_final","FT_decision","pmid","doi","pmcid","url","pmc_url"]],
+        use_container_width=True
+    )
+    st.download_button(t("download_csv"), data=to_csv_bytes(merged), file_name="records_with_screening.csv")
+
+st.subheader(t("extraction_wide"))
+if isinstance(wide, pd.DataFrame) and not wide.empty:
+    edited = st.data_editor(wide, use_container_width=True, hide_index=True, num_rows="dynamic")
+    st.session_state["extraction_wide"] = edited
+    st.download_button(t("download_csv"), data=to_csv_bytes(edited), file_name="extraction_wide.csv")
+else:
+    st.caption(t("no_key_degrade"))
+
+st.subheader(t("rob2"))
+rob_rows = []
+wide2 = st.session_state.get("extraction_wide", pd.DataFrame())
+if isinstance(wide2, pd.DataFrame) and not wide2.empty:
+    inc2 = wide2[wide2["FT_decision"] == t("ft_include")].copy()
+    for _, r in inc2.iterrows():
+        rid = r["record_id"]
+        rb = st.session_state["rob2_table"].get(rid, {}) or {}
+        name = f"{r.get('first_author','')} ({r.get('year','')})".strip() or rid
+        rob_rows.append({
+            "Study": name,
+            "D1": rb.get("D1",""),
+            "D2": rb.get("D2",""),
+            "D3": rb.get("D3",""),
+            "D4": rb.get("D4",""),
+            "D5": rb.get("D5",""),
+            "Overall": rb.get("Overall",""),
+        })
+rob_df = pd.DataFrame(rob_rows)
+if not rob_df.empty:
+    st.dataframe(rob_df, use_container_width=True)
+    st.download_button(t("download_csv"), data=to_csv_bytes(rob_df), file_name="rob2.csv")
+else:
+    st.caption(t("rob2_note"))
+
+st.subheader(t("ma"))
+if ma:
+    if ma.get("error"):
+        st.warning(t("ma_not_ready"))
+    else:
+        st.success(f"Pooled ({ma.get('measure')}): {ma.get('pooled'):.4g} (95% CI {ma.get('lower'):.4g} to {ma.get('upper'):.4g}), k={ma.get('k')}")
+        if HAS_MPL:
+            fig = plot_forest(ma)
+            if fig is not None:
+                st.pyplot(fig, clear_figure=True)
+
+st.subheader(t("prisma"))
+df3 = st.session_state.get("records", pd.DataFrame())
+ta_vals = [st.session_state["ta_final"].get(rid, t("ta_unsure")) for rid in (df3["record_id"].tolist() if isinstance(df3, pd.DataFrame) and not df3.empty else [])]
+prisma = {
+    "Records identified (PubMed total count)": int(st.session_state.get("pubmed_total") or 0),
+    "Records retrieved (limited by max_records)": int(len(df3)) if isinstance(df3, pd.DataFrame) else 0,
+    "TA Include": int(sum(1 for x in ta_vals if x == t("ta_include"))),
+    "TA Exclude": int(sum(1 for x in ta_vals if x == t("ta_exclude"))),
+    "TA Unsure": int(sum(1 for x in ta_vals if x == t("ta_unsure"))),
+    "FT Include for meta-analysis": int(sum(1 for rid in (df3["record_id"].tolist() if isinstance(df3, pd.DataFrame) and not df3.empty else []) if st.session_state["ft_decision"].get(rid) == t("ft_include"))),
+}
+st.json(prisma)
+
+st.subheader(t("export_word"))
+if HAS_DOCX and prot and isinstance(st.session_state.get("extraction_wide", pd.DataFrame()), pd.DataFrame):
+    docx_bytes = export_docx(
+        question=st.session_state.get("question",""),
+        protocol=prot,
+        pubmed_query=pub_q,
+        prisma=prisma,
+        wide=st.session_state.get("extraction_wide", pd.DataFrame()),
+        rob_df=rob_df,
+        ma=ma if ma and not ma.get("error") else None
+    )
+    if docx_bytes:
+        st.download_button(
+            "Download draft_report.docx",
+            data=docx_bytes,
+            file_name="draft_report.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        )
+else:
+    st.caption(t("word_missing"))
