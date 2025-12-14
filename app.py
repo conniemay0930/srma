@@ -7,13 +7,16 @@ import json
 import math
 import re
 import time
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import requests
 import streamlit as st
 
-# Optional deps
+# ---------------------------
+# Optional deps (degrade gracefully)
+# ---------------------------
 try:
     from PyPDF2 import PdfReader
     HAS_PYPDF2 = True
@@ -35,7 +38,7 @@ except Exception:
 
 
 # =========================
-# Config
+# Constants
 # =========================
 NCBI_ESEARCH = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
 NCBI_EFETCH  = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
@@ -45,6 +48,170 @@ EXPECTED_RECORD_COLS = [
     "title","abstract","year","journal","first_author",
     "url","doi_url","pmc_url","source"
 ]
+
+ROB2_DOMAINS = ["D1","D2","D3","D4","D5","Overall"]
+
+
+# =========================
+# i18n (zh-TW default)
+# =========================
+STR = {
+    "zh-TW": {
+        "app_title": "SR/MA 一句話原型（BYOK）",
+        "app_caption": "輸入一句問題 → 自動產出：PICO/criteria/schema、PubMed 搜尋式、抓文獻、（可選）全文抽取/ROB2/MA、Word 草稿（若安裝）。",
+        "lang": "語言",
+        "lang_help": "可切換繁體中文 / English",
+        "main_question": "研究問題（可一句話／可中文）",
+        "q_placeholder": "例如：不同種類 EDOF IOL 在白內障手術後的視覺表現比較（Symfony vs Vivity vs AT LARA...）",
+        "run": "開始執行（一步到位）",
+        "advanced": "進階設定（可選）",
+        "scope_pref": "範圍偏好",
+        "scope_fast": "快速可行（找 gap、盡快成稿）",
+        "scope_rigorous": "嚴謹完整（範圍較廣、較保守）",
+        "require_CO": "搜尋時要求 C/O（可能降低召回）",
+        "apply_rct": "套用 RCT filter（可能漏掉研究）",
+        "max_records": "PubMed 最多抓幾筆",
+        "polite_delay": "禮貌延遲（秒）",
+        "feasibility_scan": "可行性：先掃描既有 SR/MA/NMA",
+        "auto_pmc": "自動抓 PMC 開放取用全文（OA）",
+        "auto_pmc_limit": "自動抓全文最多幾篇（僅 PMC OA）",
+        "inst_access": "校內資源（可選）",
+        "openurl": "OpenURL resolver base（可選）",
+        "ezproxy": "EZproxy 前綴（可選）",
+        "llm_block": "LLM（可選，使用者自備 API key）",
+        "llm_toggle": "啟用 LLM 功能（用你自己的 API key）",
+        "llm_notice": "Key only used for this session; do not use on untrusted deployments; do not upload identifiable patient info.",
+        "base_url": "Base URL",
+        "model": "模型名稱",
+        "api_key": "API Key（不儲存、僅此 session）",
+        "clear_key": "清除 API Key",
+        "cleared": "已清除。",
+        "server_side": "伺服器端呼叫（你輸入的 key 會送到本 app 伺服器執行 API 呼叫）",
+        "no_key_degrade": "未啟用 LLM 或未提供 key：將自動降級（只做 PubMed/可行性/TA 初篩/匯出表格）。",
+        "outputs": "輸出",
+        "protocol": "Protocol（自動生成）",
+        "pubmed_query": "PubMed 搜尋式（自動生成）",
+        "diagnostics": "診斷資訊",
+        "show_diag": "展開診斷",
+        "srma_title": "可行性掃描：既有 SR/MA/NMA",
+        "records": "文獻清單（含 TA 初篩）",
+        "no_records": "沒有抓到文獻。通常是搜尋式太字面或太窄；請改成更像文獻會寫的句子（含場景/介入/比較）。",
+        "download_csv": "下載 CSV",
+        "extraction_wide": "抽取寬表（可編輯）",
+        "rob2": "ROB 2.0（草稿／可編輯）",
+        "rob2_note": "ROB 2.0 通常在全文納入後做。未啟用 LLM 或沒有全文時，這裡會空白。",
+        "ma": "Meta-analysis（fixed effect；需 Effect/CI）",
+        "ma_not_ready": "尚無法做 MA：需要 FT=Include for meta-analysis 且寬表中有 Effect + CI（可手填或由 LLM 抽取）。",
+        "prisma": "PRISMA（草稿計數）",
+        "export_word": "匯出 Word 草稿",
+        "word_missing": "Word 匯出需要安裝 python-docx；目前環境未偵測到。",
+        "done": "完成。請往下查看輸出。",
+        "step0": "0/7 生成 protocol（PICO/criteria/schema/可行性建議）…",
+        "step1": "1/7 生成 PubMed 搜尋式…",
+        "step2": "2/7 可行性掃描（SR/MA/NMA）…",
+        "step3": "3/7 抓 PubMed 文獻…",
+        "step4": "4/7 Title/Abstract 初篩…",
+        "step5": "5/7 自動抓 PMC OA 全文（可選）…",
+        "step6": "6/7 全文抽取 + ROB2（需要 LLM + 全文）…",
+        "step7": "7/7 嘗試 MA（fixed effect）…",
+        "warn_llm_failed": "LLM 呼叫失敗，已自動降級（不會中斷流程）。",
+        "privacy_tip": "提示：請勿上傳/貼上可識別病人資訊；校內訂閱全文請依規定使用（建議自行下載後再決定是否提供給 LLM）。",
+        "upload_pdf": "上傳全文 PDF（可選；用於 extraction/ROB2）",
+        "pdf_parse_fail": "PDF 解析失敗或無文字層，可能需要 OCR（請在 notes 標記 OCR REQUIRED）。",
+        "manual_fulltext": "或貼上全文文字（可選）",
+        "use_fulltext_from": "全文來源",
+        "fulltext_from_none": "不提供全文（只做 TA 初篩）",
+        "fulltext_from_pmc": "使用 PMC OA（若有抓到）",
+        "fulltext_from_upload": "使用上傳 PDF / 貼上的全文",
+        "ft_limit_hint": "全文越多、越貴、越慢；建議先小量測試。",
+        "ft_include": "Include for meta-analysis",
+        "ft_exclude": "Exclude after full-text",
+        "ft_not": "Not reviewed yet",
+        "ta_include": "Include",
+        "ta_exclude": "Exclude",
+        "ta_unsure": "Unsure",
+    },
+    "en": {
+        "app_title": "SR/MA One-question prototype (BYOK)",
+        "app_caption": "One question → PICO/criteria/schema, PubMed query, retrieval, optional full-text extraction/ROB2/MA, Word draft (if available).",
+        "lang": "Language",
+        "lang_help": "Switch zh-TW / English",
+        "main_question": "Research question (one sentence; can be non-English)",
+        "q_placeholder": "e.g., Compare different EDOF IOL types after cataract surgery (Symfony vs Vivity vs AT LARA...)",
+        "run": "Run (one-click)",
+        "advanced": "Advanced settings (optional)",
+        "scope_pref": "Scope preference",
+        "scope_fast": "Fast / feasible (gap-fill)",
+        "scope_rigorous": "Rigorous / comprehensive",
+        "require_CO": "Require C/O in search (may reduce recall)",
+        "apply_rct": "Apply RCT filter (may miss studies)",
+        "max_records": "Max PubMed records",
+        "polite_delay": "Polite delay (sec)",
+        "feasibility_scan": "Feasibility: scan existing SR/MA/NMA",
+        "auto_pmc": "Auto-fetch PMC OA full text",
+        "auto_pmc_limit": "Auto fulltext limit (PMC OA only)",
+        "inst_access": "Institution access (optional)",
+        "openurl": "OpenURL resolver base (optional)",
+        "ezproxy": "EZproxy prefix (optional)",
+        "llm_block": "LLM (optional, BYOK)",
+        "llm_toggle": "Enable LLM features (use your own API key)",
+        "llm_notice": "Key only used for this session; do not use on untrusted deployments; do not upload identifiable patient info.",
+        "base_url": "Base URL",
+        "model": "Model",
+        "api_key": "API Key (session only; not stored)",
+        "clear_key": "Clear API key",
+        "cleared": "Cleared.",
+        "server_side": "Server-side API call (your key is sent to this app server to call the API)",
+        "no_key_degrade": "LLM disabled or missing key: auto-degrade (PubMed/feasibility/TA screening/exports only).",
+        "outputs": "Outputs",
+        "protocol": "Protocol (auto)",
+        "pubmed_query": "PubMed query (auto)",
+        "diagnostics": "Diagnostics",
+        "show_diag": "Show diagnostics",
+        "srma_title": "Feasibility: existing SR/MA/NMA scan",
+        "records": "Records (with TA screening)",
+        "no_records": "No records retrieved. Usually the query is too literal/narrow; rewrite the question with context/intervention/comparator.",
+        "download_csv": "Download CSV",
+        "extraction_wide": "Extraction wide table (editable)",
+        "rob2": "ROB 2.0 (draft/editable)",
+        "rob2_note": "ROB2 is usually after FT inclusion. Empty if LLM/full text not available.",
+        "ma": "Meta-analysis (fixed effect; needs Effect/CI)",
+        "ma_not_ready": "MA not ready: needs FT=Include for meta-analysis and Effect+CI in the wide table (manual or LLM).",
+        "prisma": "PRISMA (draft counts)",
+        "export_word": "Export Word draft",
+        "word_missing": "Word export requires python-docx; not detected.",
+        "done": "Done. Scroll down for outputs.",
+        "step0": "0/7 Building protocol…",
+        "step1": "1/7 Building PubMed query…",
+        "step2": "2/7 Feasibility scan…",
+        "step3": "3/7 Fetching PubMed…",
+        "step4": "4/7 Title/Abstract screening…",
+        "step5": "5/7 Fetching PMC OA full text…",
+        "step6": "6/7 Full-text extraction + ROB2 (needs LLM + FT)…",
+        "step7": "7/7 Meta-analysis attempt…",
+        "warn_llm_failed": "LLM call failed; degraded without stopping the pipeline.",
+        "privacy_tip": "Do not upload identifiable patient info. Handle subscription full text per your institution policies.",
+        "upload_pdf": "Upload full-text PDF (optional; for extraction/ROB2)",
+        "pdf_parse_fail": "PDF parse failed/no text layer; OCR may be required (mark OCR REQUIRED in notes).",
+        "manual_fulltext": "Or paste full text (optional)",
+        "use_fulltext_from": "Full-text source",
+        "fulltext_from_none": "No full text (TA only)",
+        "fulltext_from_pmc": "Use PMC OA (if fetched)",
+        "fulltext_from_upload": "Use uploaded PDF / pasted text",
+        "ft_limit_hint": "More full text = higher cost/time; start small.",
+        "ft_include": "Include for meta-analysis",
+        "ft_exclude": "Exclude after full-text",
+        "ft_not": "Not reviewed yet",
+        "ta_include": "Include",
+        "ta_exclude": "Exclude",
+        "ta_unsure": "Unsure",
+    }
+}
+
+
+def t(key: str) -> str:
+    lang = st.session_state.get("LANG", "zh-TW")
+    return STR.get(lang, STR["zh-TW"]).get(key, key)
 
 
 # =========================
@@ -119,34 +286,59 @@ def pmc_url(pmcid: str) -> str:
         pmcid = "PMC" + pmcid
     return f"https://pmc.ncbi.nlm.nih.gov/articles/{pmcid}/"
 
+def extract_english_tokens(text: str) -> List[str]:
+    toks = re.findall(r"[A-Za-z][A-Za-z0-9\-\+]{1,}", text or "")
+    toks = [t.strip() for t in toks if t.strip()]
+    seen = set()
+    out = []
+    for tok in toks:
+        u = tok.upper()
+        if u not in seen:
+            seen.add(u)
+            out.append(tok)
+    return out
+
+def split_vs(question: str) -> Tuple[str, str, bool]:
+    q = re.sub(r"\s+", " ", (question or "").strip())
+    parts = re.split(r"\b(vs\.?|versus|compared to|compared with|compare to|comparison)\b", q, flags=re.I)
+    if len(parts) >= 3:
+        left = parts[0].strip(" -:;,.")
+        right = " ".join(parts[2:]).strip(" -:;,.")
+        return left, right, True
+    return q, "", False
+
 
 # =========================
-# Institution access (no passwords stored)
+# LLM (BYOK; no secrets)
 # =========================
-def build_openurl(resolver_base: str, doi: str = "", pmid: str = "", title: str = "") -> str:
-    resolver_base = (resolver_base or "").strip()
-    if not resolver_base:
-        return ""
-    params = ["url_ver=Z39.88-2004", "ctx_ver=Z39.88-2004"]
-    if doi:
-        params.append("rft_id=" + requests.utils.quote(f"info:doi/{doi}"))
-    elif pmid:
-        params.append("rft_id=" + requests.utils.quote(f"info:pmid/{pmid}"))
-    if title:
-        params.append("rft.title=" + requests.utils.quote(title[:200]))
-    joiner = "&" if "?" in resolver_base else "?"
-    return resolver_base + joiner + "&".join(params)
+def llm_available() -> bool:
+    ss = st.session_state
+    if not ss.get("USE_LLM", False):
+        return False
+    return bool((ss.get("LLM_BASE_URL") or "").strip()
+                and (ss.get("LLM_API_KEY") or "").strip()
+                and (ss.get("LLM_MODEL") or "").strip())
 
-def apply_ezproxy(ezproxy_prefix: str, url: str) -> str:
-    ezproxy_prefix = (ezproxy_prefix or "").strip()
-    url = (url or "").strip()
-    if not ezproxy_prefix or not url:
-        return url
-    if "url=" in ezproxy_prefix:
-        return ezproxy_prefix + requests.utils.quote(url, safe="")
-    if ezproxy_prefix.endswith("/"):
-        ezproxy_prefix = ezproxy_prefix[:-1]
-    return ezproxy_prefix + "/login?url=" + requests.utils.quote(url, safe="")
+def llm_chat(messages: List[dict], temperature: float = 0.2, timeout: int = 120) -> Optional[str]:
+    if not llm_available():
+        return None
+    ss = st.session_state
+    base = (ss.get("LLM_BASE_URL") or "").strip().rstrip("/")
+    key  = (ss.get("LLM_API_KEY") or "").strip()
+    model= (ss.get("LLM_MODEL") or "").strip()
+
+    url = base + "/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    payload = {"model": model, "messages": messages, "temperature": float(temperature)}
+
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=timeout)
+        r.raise_for_status()
+        js = r.json()
+        return js["choices"][0]["message"]["content"]
+    except Exception:
+        st.warning(t("warn_llm_failed"))
+        return None
 
 
 # =========================
@@ -185,11 +377,13 @@ def parse_pubmed_xml(xml_text: str) -> pd.DataFrame:
     for art in root.findall(".//PubmedArticle"):
         pmid = (art.findtext(".//PMID") or "").strip()
         title = norm_text(art.findtext(".//ArticleTitle") or "")
+
         ab_parts = []
         for ab in art.findall(".//AbstractText"):
             if ab.text:
                 ab_parts.append(norm_text(ab.text))
         abstract = " ".join([x for x in ab_parts if x]).strip()
+
         year = (art.findtext(".//PubDate/Year") or "").strip()
         journal = norm_text(art.findtext(".//Journal/Title") or "")
 
@@ -223,7 +417,7 @@ def parse_pubmed_xml(xml_text: str) -> pd.DataFrame:
             "url": pubmed_url(pmid),
             "doi_url": doi_url(doi),
             "pmc_url": pmc_url(pmcid) if pmcid else "",
-            "source": "PubMed",
+            "source": "PubMed"
         })
 
     df = pd.DataFrame(rows)
@@ -283,8 +477,10 @@ def fetch_pubmed(query: str, max_records: int = 300, batch_size: int = 200, poli
     if not frames:
         return safe_empty_records_df().iloc[:0].copy(), total, diag
 
-    df = pd.concat(frames, ignore_index=True) if frames else safe_empty_records_df().iloc[:0].copy()
+    df = pd.concat(frames, ignore_index=True)
     df = ensure_cols(df, EXPECTED_RECORD_COLS, "")
+
+    # de-dup robustly
     if not df.empty:
         df["title_norm"] = df["title"].fillna("").str.lower().str.replace(r"\s+"," ", regex=True).str.strip()
         df["doi_norm"] = df["doi"].fillna("").str.lower().str.strip()
@@ -300,7 +496,7 @@ def fetch_pubmed(query: str, max_records: int = 300, batch_size: int = 200, poli
 
 
 # =========================
-# PMC full text (OA)
+# PMC OA full text (optional)
 # =========================
 def fetch_pmc_fulltext_xml(pmcid: str) -> str:
     pmcid = (pmcid or "").strip()
@@ -313,7 +509,7 @@ def fetch_pmc_fulltext_xml(pmcid: str) -> str:
     r.raise_for_status()
     return r.text or ""
 
-def pmc_xml_to_text(xml_text: str, max_chars: int = 160000) -> str:
+def pmc_xml_to_text(xml_text: str, max_chars: int = 180000) -> str:
     if not xml_text:
         return ""
     import xml.etree.ElementTree as ET
@@ -324,79 +520,88 @@ def pmc_xml_to_text(xml_text: str, max_chars: int = 160000) -> str:
     texts: List[str] = []
     for tag in ["article-title", "abstract", "p", "table-wrap", "fig"]:
         for el in root.findall(f".//{tag}"):
-            t = norm_text("".join(el.itertext()))
-            if t:
-                texts.append(t)
+            t2 = norm_text("".join(el.itertext()))
+            if t2:
+                texts.append(t2)
             if sum(len(x) for x in texts) > max_chars:
                 break
     return ("\n".join(texts))[:max_chars]
 
 
 # =========================
-# LLM (OpenAI-compatible)
+# Protocol (LLM optional)
 # =========================
-def llm_available() -> bool:
-    ss = st.session_state
-    return bool((ss.get("LLM_BASE_URL") or "").strip() and (ss.get("LLM_API_KEY") or "").strip() and (ss.get("LLM_MODEL") or "").strip())
+def protocol_fallback(question: str, goal_mode: str) -> dict:
+    left, right, has_vs = split_vs(question)
+    pico = {
+        "P": "",
+        "I": left if left else question,
+        "C": right if has_vs else "",
+        "O": "",
+        "NOT": "animal OR mice OR rat OR in vitro OR case report"
+    }
 
-def llm_chat(messages: List[dict], temperature: float = 0.2, timeout: int = 120) -> Optional[str]:
-    ss = st.session_state
-    base = (ss.get("LLM_BASE_URL") or "").strip().rstrip("/")
-    key  = (ss.get("LLM_API_KEY") or "").strip()
-    model= (ss.get("LLM_MODEL") or "").strip()
-    if not (base and key and model):
-        return None
-    url = base + "/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-    payload = {"model": model, "messages": messages, "temperature": float(temperature)}
-    try:
-        r = requests.post(url, headers=headers, json=payload, timeout=timeout)
-        r.raise_for_status()
-        js = r.json()
-        return js["choices"][0]["message"]["content"]
-    except Exception as e:
-        st.warning(f"LLM call failed; fallback mode. {e}")
-        return None
+    # If question contains lots of CJK, try to keep useful English tokens in I_synonyms
+    toks = extract_english_tokens(question)
+    I_syn = []
+    if re.search(r"[\u4e00-\u9fff]", pico["I"]) and toks:
+        I_syn = toks
 
+    plan = {
+        "principles": [
+            "不要把 extraction 欄位寫死：在 PICO 層級由模型規劃 extraction sheet",
+            "先檢查是否已有相關 SR/MA/NMA；若存在，對齊並延伸（包含新 RCT 或不同比較）",
+            "納入所有 RCT primary + secondary outcomes（避免只抽你想要的那幾個）",
+            "若資料在 figure/table 或 PDF 無文字層：標記 OCR REQUIRED，指明要 OCR 的頁/圖/表"
+        ],
+        "base_cols": ["First author","Year","Design","Population details","Intervention","Comparator","Follow-up","Notes (figure/table/section)"],
+        "outcome_groups": [
+            {"group_name":"Primary outcomes","suggested_items":["Primary outcome"]},
+            {"group_name":"Secondary outcomes","suggested_items":["Secondary outcome 1","Secondary outcome 2"]}
+        ],
+        "effect_preference": ["RR","OR","HR","MD","SMD"]
+    }
 
-# =========================
-# Question -> Protocol (PICO/criteria/schema/feasibility)
-# =========================
-def extract_english_tokens(text: str) -> List[str]:
-    # pulls useful abbreviations/english device names if user asks in Chinese
-    toks = re.findall(r"[A-Za-z][A-Za-z0-9\-\+]{1,}", text or "")
-    toks = [t.strip() for t in toks if t.strip()]
-    # de-dup preserving order
-    seen = set()
-    out = []
-    for t in toks:
-        u = t.upper()
-        if u not in seen:
-            seen.add(u)
-            out.append(t)
-    return out
-
-def parse_question_to_pico(question: str) -> dict:
-    q = (question or "").strip()
-    q_norm = re.sub(r"\s+", " ", q)
-    m = re.split(r"\b(vs\.?|versus|compared to|compared with|compare to|comparison)\b", q_norm, flags=re.I)
-    if len(m) >= 3:
-        left = m[0].strip(" -:;,.")
-        right = " ".join(m[2:]).strip(" -:;,.")
-        return {"P": "", "I": left, "C": right, "O": "", "NOT": "animal OR mice OR rat OR in vitro OR case report"}
-    return {"P": "", "I": q_norm, "C": "", "O": "", "NOT": "animal OR mice OR rat OR in vitro OR case report"}
+    return {
+        "pico": pico,
+        "inclusion_decision": {
+            "scope_tradeoff": "gap_fill_fast" if goal_mode == "fast" else "rigorous_scope",
+            "recommended_scope": "（降級模式）未啟用 LLM：建議用更具體的一句話（包含場景/介入/比較/結局）以提高搜尋召回與精準度。"
+        },
+        "inclusion_criteria": ["Human studies relevant to the question.", "Prefer RCTs if meta-analysis intended."],
+        "exclusion_criteria": ["Animal/in vitro", "Case report/series only (unless required)"],
+        "search_expansion": {
+            "P_synonyms": [],
+            "I_synonyms": I_syn,
+            "C_synonyms": [],
+            "O_synonyms": [],
+            "NOT": ["animal","mice","rat","in vitro","case report"]
+        },
+        "mesh_candidates": {"P":[],"I":[],"C":[],"O":[]},
+        "feasibility_plan": {
+            "how_to_check_existing_srma": "Use PubMed filters for systematic review/meta-analysis/network meta-analysis and check overlap.",
+            "what_to_do_if_srma_exists": "Narrow PICO boundaries (population/comparator/time), include newer RCTs, or switch focus to feasibility-high gap."
+        },
+        "recommended_extraction_schema_plan": plan,
+        "analysis_plan": {
+            "effect_measures": ["RR","OR","HR","MD","SMD"],
+            "timepoint_preference": ["final follow-up"],
+            "consider_nma": "maybe",
+            "nma_node_definition": "Define nodes by intervention types/brands; ensure transitivity and connected network."
+        }
+    }
 
 def protocol_from_question_llm(question: str, goal_mode: str) -> dict:
     sys = "You are a senior SR/MA methodologist. Output ONLY valid JSON."
     user = {
-        "task": "From one clinical question, produce protocol + search expansion + feasibility plan + extraction schema plan (not hard-coded).",
-        "goal_mode": goal_mode,
+        "task": "From one question, produce protocol + inclusion criteria decision + search expansion + extraction schema plan (not hard-coded) + NMA considerations.",
+        "goal_mode": "Fast / feasible (gap-fill)" if goal_mode == "fast" else "Rigorous / comprehensive",
         "question": question,
         "output_schema": {
             "pico": {"P":"","I":"","C":"","O":"","NOT":""},
             "inclusion_decision": {
                 "scope_tradeoff": "gap_fill_fast OR rigorous_scope",
-                "recommended_scope": "How to set PICO boundaries based on existing evidence and feasibility."
+                "recommended_scope": "How to set PICO boundaries given existing evidence and feasibility."
             },
             "inclusion_criteria": ["..."],
             "exclusion_criteria": ["..."],
@@ -412,8 +617,9 @@ def protocol_from_question_llm(question: str, goal_mode: str) -> dict:
             "recommended_extraction_schema_plan": {
                 "principles": [
                     "Do not hard-code columns; define at PICO level",
-                    "Check whether prior SR/MA exists and align/extend",
-                    "Enumerate ALL RCT primary and secondary outcomes for extraction"
+                    "Check whether prior SR/MA/NMA exists and align/extend",
+                    "Enumerate ALL RCT primary and secondary outcomes for extraction",
+                    "Include OCR/figure/table instructions"
                 ],
                 "base_cols": ["First author","Year","Design","Population details","Intervention","Comparator","Follow-up","Notes (figure/table/section)"],
                 "outcome_groups": [
@@ -425,14 +631,15 @@ def protocol_from_question_llm(question: str, goal_mode: str) -> dict:
             "analysis_plan": {
                 "effect_measures": ["RR","OR","HR","MD","SMD"],
                 "timepoint_preference": ["final follow-up"],
-                "consider_nma": "yes/no",
-                "nma_node_definition": "how to define nodes"
+                "consider_nma": "yes/no/maybe",
+                "nma_node_definition": "how to define nodes for NMA"
             }
         },
         "constraints": [
-            "Be topic-agnostic; do not assume specialty.",
-            "Maximize recall: include abbreviations, variant spellings, and common synonyms.",
-            "If question is non-English, translate/expand to English search terms."
+            "Topic-agnostic; do not assume a specialty.",
+            "Maximize recall with abbreviations/variant spellings.",
+            "If question is non-English, translate/expand to English search terms.",
+            "Avoid hallucinating; mark uncertainty explicitly."
         ]
     }
     txt = llm_chat(
@@ -445,58 +652,9 @@ def protocol_from_question_llm(question: str, goal_mode: str) -> dict:
         return {"error":"bad_json","raw":(txt or "")}
     return js
 
-def protocol_fallback(question: str, goal_mode: str) -> dict:
-    pico = parse_question_to_pico(question)
-    toks = extract_english_tokens(question)
-    # If user wrote Chinese sentence, use extracted tokens as I-synonyms to avoid nonsense [tiab]
-    I0 = (pico.get("I") or "").strip()
-    C0 = (pico.get("C") or "").strip()
-
-    def expand(term: str) -> List[str]:
-        t = (term or "").strip()
-        if not t:
-            return []
-        syn = [t, t.replace("-", " "), t.replace(" ", "-")]
-        return list(dict.fromkeys([s for s in syn if s]))
-
-    I_syn = expand(I0)
-    C_syn = expand(C0)
-    # If term is long and contains CJK, prefer tokens
-    if re.search(r"[\u4e00-\u9fff]", I0) and toks:
-        I_syn = toks
-        pico["I"] = toks[0]
-    if re.search(r"[\u4e00-\u9fff]", C0) and toks:
-        C_syn = toks
-
-    return {
-        "pico": pico,
-        "inclusion_decision": {"scope_tradeoff":"gap_fill_fast" if goal_mode.startswith("Fast") else "rigorous_scope",
-                               "recommended_scope":"Fallback mode. Configure LLM for best PICO boundary + criteria."},
-        "inclusion_criteria": ["Human studies relevant to the question."],
-        "exclusion_criteria": ["Animal/in vitro", "Case reports/series only (unless specifically needed)."],
-        "search_expansion": {"P_synonyms": [], "I_synonyms": I_syn, "C_synonyms": C_syn, "O_synonyms": [],
-                             "NOT":["animal","mice","rat","in vitro","case report"]},
-        "mesh_candidates": {"P": [], "I": [], "C": [], "O": []},
-        "feasibility_plan": {"how_to_check_existing_srma":"Scan SR/MA/NMA in PubMed first.",
-                             "what_to_do_if_srma_exists":"Consider narrowing population, newer RCTs, or different comparator."},
-        "recommended_extraction_schema_plan": {
-            "principles": [
-                "Do not hard-code columns; define at PICO level",
-                "Check whether prior SR/MA exists and align/extend",
-                "Enumerate ALL RCT primary and secondary outcomes for extraction"
-            ],
-            "base_cols": ["First author","Year","Design","Population details","Intervention","Comparator","Follow-up","Notes (figure/table/section)"],
-            "outcome_groups": [{"group_name":"Primary outcomes","suggested_items":["Primary outcome"]},
-                               {"group_name":"Secondary outcomes","suggested_items":["Secondary outcome 1","Secondary outcome 2"]}],
-            "effect_preference": ["RR","OR","HR","MD","SMD"]
-        },
-        "analysis_plan": {"effect_measures":["RR","OR","HR","MD","SMD"],"timepoint_preference":["final follow-up"],"consider_nma":"no","nma_node_definition":""},
-        "goal_mode": goal_mode
-    }
-
 
 # =========================
-# Query builder (recall-friendly; uses I/C even if P empty)
+# Query builder
 # =========================
 def build_concept_group(term: str, mesh_list: List[str], synonyms: List[str], field_tag: str = "tiab") -> str:
     term = (term or "").strip()
@@ -521,7 +679,6 @@ def build_concept_group(term: str, mesh_list: List[str], synonyms: List[str], fi
         blocks.append("(" + " OR ".join(free_blocks) + ")")
     if mesh_blocks:
         blocks.append("(" + " OR ".join(mesh_blocks) + ")")
-
     if not blocks:
         return ""
     return "(" + " OR ".join(blocks) + ")" if len(blocks) > 1 else blocks[0]
@@ -536,6 +693,7 @@ def build_pubmed_query(protocol: dict, strict_CO: bool, include_rct_filter: bool
     C = build_concept_group(pico.get("C",""), mesh.get("C", []), exp.get("C_synonyms", []))
     O = build_concept_group(pico.get("O",""), mesh.get("O", []), exp.get("O_synonyms", []))
 
+    # Recall-first: use I (and C if present), even if P empty
     parts = []
     if P: parts.append(P)
     if I: parts.append(I)
@@ -579,13 +737,13 @@ def scan_sr_ma_nma(pubmed_query: str, top_n: int = 25) -> Dict:
         if ids:
             xml, _ = pubmed_efetch_xml(ids)
             hits = parse_pubmed_xml(xml)[["pmid","doi","pmcid","title","year","first_author","journal","url","doi_url","pmc_url"]]
-        return {"summary": f"Existing SR/MA/NMA scan: PubMed count≈{count} (showing top {min(len(ids), top_n)}).", "hits": hits}
+        return {"summary": f"PubMed count≈{count} (showing top {min(len(ids), top_n)}).", "hits": hits}
     except Exception as e:
         return {"summary": f"Scan failed: {e}", "hits": pd.DataFrame()}
 
 
 # =========================
-# Title/Abstract screening (LLM optional)
+# Title/Abstract screening
 # =========================
 def screen_rule_based(row: pd.Series, protocol: dict) -> Dict:
     title = (row.get("title","") or "")
@@ -605,12 +763,12 @@ def screen_rule_based(row: pd.Series, protocol: dict) -> Dict:
         return any(t in text for t in toks)
 
     if NOT and hit(NOT):
-        return {"label":"Exclude","confidence":0.8,"reason":"NOT keyword hit"}
+        return {"label": t("ta_exclude"), "confidence": 0.8, "reason": "NOT keyword hit"}
     if I and hit(I) and (not C or hit(C)):
-        return {"label":"Include","confidence":0.7,"reason":"Key terms present"}
+        return {"label": t("ta_include"), "confidence": 0.7, "reason": "Key terms present"}
     if any(w in text for w in ["randomized","randomised","trial","controlled"]) and hit(I):
-        return {"label":"Include","confidence":0.65,"reason":"Trial-like + match"}
-    return {"label":"Unsure","confidence":0.4,"reason":"Insufficient TA signal"}
+        return {"label": t("ta_include"), "confidence": 0.65, "reason": "Trial-like + match"}
+    return {"label": t("ta_unsure"), "confidence": 0.4, "reason": "Insufficient TA signal"}
 
 def screen_llm(row: pd.Series, protocol: dict) -> Dict:
     sys = "You are an SR/MA screening assistant. Output ONLY valid JSON."
@@ -630,11 +788,53 @@ def screen_llm(row: pd.Series, protocol: dict) -> Dict:
     js = json_from_text(txt or "")
     if not js:
         return screen_rule_based(row, protocol)
-    return {"label": js.get("label","Unsure"), "confidence": js.get("confidence",0.0), "reason": js.get("reason","")}
+    lab = str(js.get("label","Unsure")).strip()
+    # normalize to UI language labels
+    if lab.lower().startswith("incl"):
+        lab2 = t("ta_include")
+    elif lab.lower().startswith("excl"):
+        lab2 = t("ta_exclude")
+    else:
+        lab2 = t("ta_unsure")
+    conf = js.get("confidence", 0.0)
+    try:
+        conf = float(conf)
+    except Exception:
+        conf = 0.0
+    return {"label": lab2, "confidence": conf, "reason": str(js.get("reason",""))}
 
 
 # =========================
-# Full-text extraction + ROB2 (LLM)
+# Full-text ingestion (upload or paste)
+# =========================
+def pdf_to_text(file_bytes: bytes, max_chars: int = 180000) -> str:
+    if not HAS_PYPDF2:
+        return ""
+    try:
+        reader = PdfReader(io.BytesIO(file_bytes))
+        chunks = []
+        for p in reader.pages[:50]:
+            try:
+                chunks.append(p.extract_text() or "")
+            except Exception:
+                continue
+        txt = "\n".join(chunks)
+        txt = re.sub(r"\s+", " ", txt).strip()
+        return txt[:max_chars]
+    except Exception:
+        return ""
+
+def choose_fulltext_source(record_id: str, records: pd.DataFrame, pmc_text_map: dict, uploaded_text: str) -> str:
+    # Prefer uploaded/pasted (user explicit) over PMC (implicit), if provided
+    if uploaded_text and uploaded_text.strip():
+        return uploaded_text
+    if pmc_text_map.get(record_id):
+        return pmc_text_map[record_id]
+    return ""
+
+
+# =========================
+# Extraction + ROB2 prompts (LLM)
 # =========================
 def build_extraction_prompt(protocol: dict) -> str:
     pico = protocol.get("pico", {}) or {}
@@ -669,7 +869,7 @@ Extraction schema planning requirement:
   principles={json.dumps(plan.get("principles", []), ensure_ascii=False)}
   base_cols={json.dumps(base_cols, ensure_ascii=False)}
   outcome_groups={json.dumps(outcome_groups, ensure_ascii=False)}
-- Explicitly check/mention whether prior SR/MA exists (if the text references it) and align/extend.
+- Explicitly check/mention whether prior SR/MA exists (if referenced) and align/extend.
 - Enumerate ALL RCT primary + secondary outcomes that are relevant.
 
 Effect estimates (if available):
@@ -743,7 +943,7 @@ def rob2_llm(fulltext: str, protocol: dict) -> dict:
 
 
 # =========================
-# Fixed-effect MA (requires Effect + CI)
+# Fixed-effect MA (needs Effect + CI)
 # =========================
 def _to_float(x) -> Optional[float]:
     try:
@@ -832,7 +1032,7 @@ def plot_forest(ma: dict):
 
 
 # =========================
-# Word export
+# Word export (optional)
 # =========================
 def export_docx(question: str, protocol: dict, pubmed_query: str, prisma: dict,
                 wide: pd.DataFrame, rob_df: pd.DataFrame, ma: Optional[dict]) -> Optional[bytes]:
@@ -859,12 +1059,12 @@ def export_docx(question: str, protocol: dict, pubmed_query: str, prisma: dict,
 
     doc.add_heading("Extraction (wide snapshot)", level=2)
     if isinstance(wide, pd.DataFrame) and not wide.empty:
-        cols = list(wide.columns)[:min(8, len(wide.columns))]
-        t = doc.add_table(rows=1, cols=len(cols))
+        cols = list(wide.columns)[:min(10, len(wide.columns))]
+        t2 = doc.add_table(rows=1, cols=len(cols))
         for i, c in enumerate(cols):
-            t.rows[0].cells[i].text = c
+            t2.rows[0].cells[i].text = c
         for _, r in wide.head(25).iterrows():
-            row = t.add_row().cells
+            row = t2.add_row().cells
             for i, c in enumerate(cols):
                 row[i].text = str(r.get(c, ""))
     else:
@@ -872,11 +1072,11 @@ def export_docx(question: str, protocol: dict, pubmed_query: str, prisma: dict,
 
     doc.add_heading("ROB 2.0 (snapshot)", level=2)
     if isinstance(rob_df, pd.DataFrame) and not rob_df.empty:
-        t = doc.add_table(rows=1, cols=len(rob_df.columns))
+        t3 = doc.add_table(rows=1, cols=len(rob_df.columns))
         for i, c in enumerate(rob_df.columns):
-            t.rows[0].cells[i].text = c
+            t3.rows[0].cells[i].text = c
         for _, r in rob_df.iterrows():
-            row = t.add_row().cells
+            row = t3.add_row().cells
             for i, c in enumerate(rob_df.columns):
                 row[i].text = str(r.get(c, ""))
     else:
@@ -895,16 +1095,14 @@ def export_docx(question: str, protocol: dict, pubmed_query: str, prisma: dict,
 
 
 # =========================
-# Streamlit UI
+# Session init
 # =========================
-st.set_page_config(page_title="SR/MA One-question", layout="wide")
-st.title("SR/MA (One-question prototype)")
-st.caption("一句問題 → protocol/feasibility/query → TA screening → (可選) PMC 全文 → extraction/ROB2 → MA → Word")
-
 def init_state():
     ss = st.session_state
+    ss.setdefault("LANG", "zh-TW")
+
     ss.setdefault("question", "")
-    ss.setdefault("goal_mode", "Fast / feasible (gap-fill)")
+    ss.setdefault("goal_mode", "fast")  # fast/rigorous
     ss.setdefault("strict_CO", False)
     ss.setdefault("include_rct_filter", False)
     ss.setdefault("include_srma_scan", True)
@@ -912,14 +1110,12 @@ def init_state():
     ss.setdefault("polite_delay", 0.0)
 
     ss.setdefault("auto_fetch_pmc", True)
-    ss.setdefault("auto_fulltext_limit", 10)
+    ss.setdefault("auto_fulltext_limit", 8)
 
-    ss.setdefault("RESOLVER_BASE", "")
-    ss.setdefault("EZPROXY", "")
-
-    ss.setdefault("LLM_BASE_URL", "")
+    ss.setdefault("USE_LLM", False)
+    ss.setdefault("LLM_BASE_URL", "https://api.openai.com")
+    ss.setdefault("LLM_MODEL", "gpt-4o-mini")
     ss.setdefault("LLM_API_KEY", "")
-    ss.setdefault("LLM_MODEL", "")
 
     ss.setdefault("protocol", None)
     ss.setdefault("pubmed_query", "")
@@ -929,10 +1125,13 @@ def init_state():
     ss.setdefault("diag", {})
 
     ss.setdefault("screening", pd.DataFrame())
-    ss.setdefault("ta_final", {})     # record_id -> Include/Exclude/Unsure
-    ss.setdefault("ft_decision", {})  # record_id -> Not reviewed / Include for MA / Exclude
-    ss.setdefault("ft_reason", {})    # record_id -> reason
-    ss.setdefault("fulltext", {})     # record_id -> text
+    ss.setdefault("ta_final", {})       # record_id -> Include/Exclude/Unsure
+    ss.setdefault("ft_decision", {})    # record_id -> Not reviewed / Include for MA / Exclude
+    ss.setdefault("ft_reason", {})      # record_id -> reason
+    ss.setdefault("pmc_fulltext", {})   # record_id -> text
+
+    ss.setdefault("uploaded_fulltext", "")  # global text from upload/paste
+    ss.setdefault("fulltext_source", "none")  # none/pmc/upload
 
     ss.setdefault("extraction_wide", pd.DataFrame())
     ss.setdefault("rob2_table", {})
@@ -941,76 +1140,140 @@ def init_state():
 
 init_state()
 
+
+# =========================
+# UI
+# =========================
+st.set_page_config(page_title=t("app_title"), layout="wide")
+st.title(t("app_title"))
+st.caption(t("app_caption"))
+st.info(t("privacy_tip"))
+
+# Language toggle
 with st.sidebar:
-    st.subheader("Advanced (optional)")
-    st.session_state["goal_mode"] = st.selectbox(
-        "Scope preference",
-        ["Fast / feasible (gap-fill)", "Rigorous / comprehensive"],
-        index=0 if st.session_state["goal_mode"].startswith("Fast") else 1
+    st.session_state["LANG"] = st.selectbox(
+        t("lang"),
+        ["zh-TW", "en"],
+        index=0 if st.session_state.get("LANG","zh-TW") == "zh-TW" else 1,
+        help=t("lang_help")
     )
-    st.session_state["include_srma_scan"] = st.checkbox("Feasibility: scan existing SR/MA/NMA", value=st.session_state["include_srma_scan"])
-    st.session_state["strict_CO"] = st.checkbox("Search requires C/O (lower recall)", value=st.session_state["strict_CO"])
-    st.session_state["include_rct_filter"] = st.checkbox("Apply RCT filter (may miss studies)", value=st.session_state["include_rct_filter"])
-    st.session_state["max_records"] = st.number_input("Max PubMed records", 50, 5000, int(st.session_state["max_records"]), 50)
-    st.session_state["polite_delay"] = st.slider("Polite delay (sec)", 0.0, 1.0, float(st.session_state["polite_delay"]), 0.1)
 
+# Advanced settings
+with st.sidebar:
+    with st.expander(t("advanced"), expanded=False):
+        goal = st.selectbox(
+            t("scope_pref"),
+            [t("scope_fast"), t("scope_rigorous")],
+            index=0 if st.session_state["goal_mode"] == "fast" else 1
+        )
+        st.session_state["goal_mode"] = "fast" if goal == t("scope_fast") else "rigorous"
+
+        st.session_state["strict_CO"] = st.checkbox(t("require_CO"), value=st.session_state["strict_CO"])
+        st.session_state["include_rct_filter"] = st.checkbox(t("apply_rct"), value=st.session_state["include_rct_filter"])
+        st.session_state["include_srma_scan"] = st.checkbox(t("feasibility_scan"), value=st.session_state["include_srma_scan"])
+        st.session_state["max_records"] = st.number_input(t("max_records"), 50, 5000, int(st.session_state["max_records"]), 50)
+        st.session_state["polite_delay"] = st.slider(t("polite_delay"), 0.0, 1.0, float(st.session_state["polite_delay"]), 0.1)
+
+        st.session_state["auto_fetch_pmc"] = st.checkbox(t("auto_pmc"), value=st.session_state["auto_fetch_pmc"])
+        st.session_state["auto_fulltext_limit"] = st.number_input(t("auto_pmc_limit"), 0, 50, int(st.session_state["auto_fulltext_limit"]), 1)
+        st.caption(t("ft_limit_hint"))
+
+# BYOK LLM block
+with st.sidebar:
     st.markdown("---")
-    st.session_state["auto_fetch_pmc"] = st.checkbox("Auto-fetch PMC OA full text", value=st.session_state["auto_fetch_pmc"])
-    st.session_state["auto_fulltext_limit"] = st.number_input("Auto fulltext fetch limit", 0, 50, int(st.session_state["auto_fulltext_limit"]), 1)
+    st.subheader(t("llm_block"))
+    st.session_state["USE_LLM"] = st.checkbox(t("llm_toggle"), value=bool(st.session_state.get("USE_LLM", False)))
+    st.info(t("llm_notice"))
 
-    st.markdown("---")
-    st.markdown("Institution access (optional; no passwords stored)")
-    st.session_state["RESOLVER_BASE"] = st.text_input("OpenURL resolver base", value=st.session_state["RESOLVER_BASE"])
-    st.session_state["EZPROXY"] = st.text_input("EZproxy prefix", value=st.session_state["EZPROXY"])
+    if st.session_state["USE_LLM"]:
+        st.session_state["LLM_BASE_URL"] = st.text_input(t("base_url"), value=st.session_state.get("LLM_BASE_URL", "https://api.openai.com"))
+        st.session_state["LLM_MODEL"] = st.text_input(t("model"), value=st.session_state.get("LLM_MODEL", "gpt-4o-mini"))
+        st.session_state["LLM_API_KEY"] = st.text_input(t("api_key"), value=st.session_state.get("LLM_API_KEY",""), type="password")
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button(t("clear_key")):
+                st.session_state["LLM_API_KEY"] = ""
+                st.success(t("cleared"))
+        with c2:
+            st.caption(t("server_side"))
+    else:
+        st.session_state["LLM_API_KEY"] = ""
+        st.caption(t("no_key_degrade"))
 
-    st.markdown("---")
-    st.markdown("LLM (OpenAI-compatible; required for extraction/ROB2 auto)")
-    st.session_state["LLM_BASE_URL"] = st.text_input("Base URL", value=st.session_state["LLM_BASE_URL"])
-    st.session_state["LLM_API_KEY"] = st.text_input("API Key", value=st.session_state["LLM_API_KEY"], type="password")
-    st.session_state["LLM_MODEL"] = st.text_input("Model", value=st.session_state["LLM_MODEL"])
-    st.caption("沒填：仍會抓文獻 + 規則初篩；但不會自動 full-text extraction/ROB2。")
-
-st.session_state["question"] = st.text_area(
-    "Research question (one sentence)",
-    value=st.session_state["question"],
-    height=80,
-    placeholder="e.g., Does intervention A improve outcome B vs comparator C in population P?"
+# Full-text inputs (optional)
+st.subheader(t("use_fulltext_from"))
+ft_source = st.radio(
+    t("use_fulltext_from"),
+    options=[t("fulltext_from_none"), t("fulltext_from_pmc"), t("fulltext_from_upload")],
+    index=0,
+    horizontal=True
 )
+if ft_source == t("fulltext_from_none"):
+    st.session_state["fulltext_source"] = "none"
+elif ft_source == t("fulltext_from_pmc"):
+    st.session_state["fulltext_source"] = "pmc"
+else:
+    st.session_state["fulltext_source"] = "upload"
 
-run = st.button("Run (one-click pipeline)", type="primary")
+if st.session_state["fulltext_source"] == "upload":
+    up = st.file_uploader(t("upload_pdf"), type=["pdf"])
+    pasted = st.text_area(t("manual_fulltext"), value="", height=160)
+    fulltxt = ""
 
+    if up is not None:
+        file_bytes = up.read()
+        fulltxt = pdf_to_text(file_bytes)
+        if not fulltxt:
+            st.warning(t("pdf_parse_fail"))
+    if pasted.strip():
+        fulltxt = pasted.strip()
+
+    st.session_state["uploaded_fulltext"] = fulltxt
+
+# Main question + Run
+st.session_state["question"] = st.text_area(
+    t("main_question"),
+    value=st.session_state["question"],
+    height=90,
+    placeholder=t("q_placeholder")
+)
+run = st.button(t("run"), type="primary")
+
+
+# =========================
+# Pipeline run
+# =========================
 if run:
     q = (st.session_state["question"] or "").strip()
     if not q:
-        st.error("Please enter a research question.")
+        st.error("Please enter a question.")
         st.stop()
 
-    # 0) Protocol
-    with st.spinner("0/7 Building protocol (PICO/criteria/feasibility/schema)…"):
+    # Step 0: protocol
+    with st.spinner(t("step0")):
         if llm_available():
             prot = protocol_from_question_llm(q, st.session_state["goal_mode"])
             if prot.get("error"):
-                st.warning("Protocol JSON parse failed; fallback used.")
                 prot = protocol_fallback(q, st.session_state["goal_mode"])
         else:
             prot = protocol_fallback(q, st.session_state["goal_mode"])
         st.session_state["protocol"] = prot
 
-    # 1) Query
-    with st.spinner("1/7 Building PubMed query…"):
+    # Step 1: query
+    with st.spinner(t("step1")):
         st.session_state["pubmed_query"] = build_pubmed_query(
             st.session_state["protocol"],
             st.session_state["strict_CO"],
             st.session_state["include_rct_filter"]
         )
 
-    # 2) Feasibility scan
+    # Step 2: feasibility scan
     if st.session_state["include_srma_scan"]:
-        with st.spinner("2/7 Feasibility scan (SR/MA/NMA)…"):
+        with st.spinner(t("step2")):
             st.session_state["srma_scan"] = scan_sr_ma_nma(st.session_state["pubmed_query"], top_n=25)
 
-    # 3) Fetch PubMed
-    with st.spinner("3/7 Fetching PubMed records…"):
+    # Step 3: PubMed retrieval
+    with st.spinner(t("step3")):
         df, total, diag = fetch_pubmed(
             st.session_state["pubmed_query"],
             max_records=int(st.session_state["max_records"]),
@@ -1023,13 +1286,13 @@ if run:
         st.session_state["diag"] = diag
 
         for rid in df["record_id"].tolist():
-            st.session_state["ta_final"].setdefault(rid, "Unsure")
-            st.session_state["ft_decision"].setdefault(rid, "Not reviewed yet")
+            st.session_state["ta_final"].setdefault(rid, t("ta_unsure"))
+            st.session_state["ft_decision"].setdefault(rid, t("ft_not"))
             st.session_state["ft_reason"].setdefault(rid, "")
-            st.session_state["fulltext"].setdefault(rid, "")
+            st.session_state["pmc_fulltext"].setdefault(rid, "")
 
-    # 4) TA screening
-    with st.spinner("4/7 Title/Abstract screening…"):
+    # Step 4: TA screening
+    with st.spinner(t("step4")):
         out = []
         for _, r in st.session_state["records"].iterrows():
             res = screen_llm(r, st.session_state["protocol"]) if llm_available() else screen_rule_based(r, st.session_state["protocol"])
@@ -1038,52 +1301,42 @@ if run:
             out.append({"record_id": rid, "AI_label": res["label"], "AI_confidence": res["confidence"], "AI_reason": res["reason"]})
         st.session_state["screening"] = pd.DataFrame(out)
 
-    # 5) Auto-fetch PMC OA full text (candidates)
+    # Step 5: Auto-fetch PMC OA full text
     if st.session_state["auto_fetch_pmc"]:
-        with st.spinner("5/7 Auto-fetching PMC OA full text…"):
+        with st.spinner(t("step5")):
             merged = st.session_state["records"].merge(st.session_state["screening"], on="record_id", how="left")
             merged = ensure_cols(merged, ["AI_label"], "")
-            cand = merged[merged["AI_label"].isin(["Include","Unsure"])].copy()
+            cand = merged[merged["AI_label"].isin([t("ta_include"), t("ta_unsure")])].copy()
             cand = cand[cand["pmcid"].astype(str).str.strip().astype(bool)].head(int(st.session_state["auto_fulltext_limit"]))
             for _, r in cand.iterrows():
                 rid = r["record_id"]
-                if (st.session_state["fulltext"].get(rid) or "").strip():
+                if (st.session_state["pmc_fulltext"].get(rid) or "").strip():
                     continue
                 try:
                     xml = fetch_pmc_fulltext_xml(r.get("pmcid",""))
                     txt = pmc_xml_to_text(xml)
                     if txt.strip():
-                        st.session_state["fulltext"][rid] = txt
+                        st.session_state["pmc_fulltext"][rid] = txt
                 except Exception:
-                    pass
+                    continue
 
-    # 6) Extraction + ROB2 (LLM only) + wide table
-    with st.spinner("6/7 Extraction + ROB2 (when full text available)…"):
+    # Step 6: Extraction + ROB2 (needs LLM + FT)
+    with st.spinner(t("step6")):
         prot = st.session_state["protocol"]
         merged = st.session_state["records"].merge(st.session_state["screening"], on="record_id", how="left")
         merged = ensure_cols(merged, ["AI_label","AI_reason","AI_confidence"], "")
 
-        # add institution links
-        resolver = st.session_state["RESOLVER_BASE"]
-        ezp = st.session_state["EZPROXY"]
-        if resolver:
-            merged["openurl"] = merged.apply(
-                lambda x: apply_ezproxy(ezp, build_openurl(resolver, doi=x.get("doi",""), pmid=x.get("pmid",""), title=x.get("title",""))),
-                axis=1
-            )
-        else:
-            merged["openurl"] = ""
+        # Wide table skeleton
+        wide = merged[["record_id","pmid","doi","pmcid","year","first_author","title","url","doi_url","pmc_url","AI_label","AI_reason"]].copy()
+        wide["TA_final"] = wide["record_id"].map(lambda rid: st.session_state["ta_final"].get(rid, t("ta_unsure")))
+        wide["FT_decision"] = wide["record_id"].map(lambda rid: st.session_state["ft_decision"].get(rid, t("ft_not")))
+        wide["FT_reason"] = wide["record_id"].map(lambda rid: st.session_state["ft_reason"].get(rid, ""))
 
         plan = prot.get("recommended_extraction_schema_plan", {}) or {}
         base_cols = plan.get("base_cols", []) or []
         outcome_items = []
         for g in (plan.get("outcome_groups", []) or []):
             outcome_items.extend(g.get("suggested_items", []) or [])
-
-        wide = merged[["record_id","pmid","doi","year","first_author","title","url","doi_url","pmc_url","openurl","AI_label","AI_reason"]].copy()
-        wide["TA_final"] = wide["record_id"].map(lambda rid: st.session_state["ta_final"].get(rid, "Unsure"))
-        wide["FT_decision"] = wide["record_id"].map(lambda rid: st.session_state["ft_decision"].get(rid, "Not reviewed yet"))
-        wide["FT_reason"] = wide["record_id"].map(lambda rid: st.session_state["ft_reason"].get(rid, ""))
 
         for c in base_cols:
             if c not in wide.columns:
@@ -1096,12 +1349,21 @@ if run:
             if c not in wide.columns:
                 wide[c] = ""
 
+        # Only do LLM extraction if enabled + key exists + fulltext source permits
         if llm_available():
             for _, r in wide.iterrows():
                 rid = r["record_id"]
-                if st.session_state["ta_final"].get(rid) not in ["Include","Unsure"]:
+                if st.session_state["ta_final"].get(rid) not in [t("ta_include"), t("ta_unsure")]:
                     continue
-                ft = (st.session_state["fulltext"].get(rid) or "").strip()
+
+                # select full text based on user choice
+                if st.session_state["fulltext_source"] == "none":
+                    ft = ""
+                elif st.session_state["fulltext_source"] == "pmc":
+                    ft = (st.session_state["pmc_fulltext"].get(rid) or "").strip()
+                else:
+                    ft = (st.session_state["uploaded_fulltext"] or "").strip()
+
                 if not ft:
                     continue
 
@@ -1109,14 +1371,22 @@ if run:
                 if ex.get("error"):
                     continue
 
-                dec = ex.get("fulltext_decision")
+                dec = str(ex.get("fulltext_decision","")).strip()
                 if dec in ["Include for meta-analysis","Exclude after full-text","Not reviewed yet"]:
-                    st.session_state["ft_decision"][rid] = dec
-                    wide.loc[wide["record_id"] == rid, "FT_decision"] = dec
+                    # map to UI lang strings for storage/display
+                    if dec.startswith("Include"):
+                        dec_ui = t("ft_include")
+                    elif dec.startswith("Exclude"):
+                        dec_ui = t("ft_exclude")
+                    else:
+                        dec_ui = t("ft_not")
+                    st.session_state["ft_decision"][rid] = dec_ui
+                    wide.loc[wide["record_id"] == rid, "FT_decision"] = dec_ui
 
-                if ex.get("fulltext_reason"):
-                    st.session_state["ft_reason"][rid] = str(ex.get("fulltext_reason"))
-                    wide.loc[wide["record_id"] == rid, "FT_reason"] = str(ex.get("fulltext_reason"))
+                reason = str(ex.get("fulltext_reason","") or "").strip()
+                if reason:
+                    st.session_state["ft_reason"][rid] = reason
+                    wide.loc[wide["record_id"] == rid, "FT_reason"] = reason
 
                 schema_obj = ex.get("extraction_schema")
                 if schema_obj:
@@ -1125,16 +1395,17 @@ if run:
                     wide.loc[wide["record_id"] == rid, "_extraction_schema_json"] = json.dumps(schema_obj, ensure_ascii=False)
 
                 fields = ex.get("extracted_fields") or {}
+                # Put known columns; unknown go into _extra_fields_json
                 for k, v in fields.items():
-                    if k not in wide.columns:
+                    if k in wide.columns:
+                        wide.loc[wide["record_id"] == rid, k] = "" if v is None else str(v)
+                    else:
                         if "_extra_fields_json" not in wide.columns:
                             wide["_extra_fields_json"] = ""
                         cur = wide.loc[wide["record_id"] == rid, "_extra_fields_json"].values[0]
                         bag = json.loads(cur) if cur else {}
                         bag[k] = v
                         wide.loc[wide["record_id"] == rid, "_extra_fields_json"] = json.dumps(bag, ensure_ascii=False)
-                    else:
-                        wide.loc[wide["record_id"] == rid, k] = "" if v is None else str(v)
 
                 meta = ex.get("meta") or {}
                 wide.loc[wide["record_id"] == rid, "Effect_measure"] = str(meta.get("effect_measure",""))
@@ -1144,30 +1415,31 @@ if run:
                 wide.loc[wide["record_id"] == rid, "Timepoint"] = str(meta.get("timepoint",""))
                 wide.loc[wide["record_id"] == rid, "Unit"] = str(meta.get("unit",""))
 
-                if st.session_state["ft_decision"].get(rid) == "Include for meta-analysis":
+                # ROB2 only for FT included
+                if st.session_state["ft_decision"].get(rid) == t("ft_include"):
                     rb = rob2_llm(ft, prot)
                     if not rb.get("error"):
                         st.session_state["rob2_raw"][rid] = rb
-                        st.session_state["rob2_table"][rid] = {k: (rb.get(k, {}) or {}).get("judgement","") for k in ["D1","D2","D3","D4","D5","Overall"]}
+                        st.session_state["rob2_table"][rid] = {k: (rb.get(k, {}) or {}).get("judgement","") for k in ROB2_DOMAINS}
 
         st.session_state["extraction_wide"] = wide
 
-    # 7) MA attempt
-    with st.spinner("7/7 Meta-analysis (fixed effect) attempt…"):
+    # Step 7: MA attempt
+    with st.spinner(t("step7")):
         wide = st.session_state["extraction_wide"]
-        inc = wide[wide["FT_decision"] == "Include for meta-analysis"].copy() if isinstance(wide, pd.DataFrame) else pd.DataFrame()
+        inc = wide[wide["FT_decision"] == t("ft_include")].copy() if isinstance(wide, pd.DataFrame) and not wide.empty else pd.DataFrame()
         ma_df = inc[["record_id","title","Effect_measure","Effect","Lower_CI","Upper_CI","Timepoint","Unit"]].copy() if not inc.empty else pd.DataFrame()
         st.session_state["ma_result"] = fixed_effect_ma(ma_df) if not ma_df.empty else {"error":"no included studies"}
 
-    st.success("Done. Scroll down for outputs.")
+    st.success(t("done"))
 
 
 # =========================
 # Outputs (persistent)
 # =========================
-st.header("Outputs")
+st.header(t("outputs"))
 
-prot = st.session_state.get("protocol")
+prot = st.session_state.get("protocol") or {}
 pub_q = st.session_state.get("pubmed_query","")
 df = st.session_state.get("records", safe_empty_records_df().iloc[:0].copy())
 scr = st.session_state.get("screening", pd.DataFrame())
@@ -1178,54 +1450,55 @@ diag = st.session_state.get("diag", {}) or {}
 
 colA, colB = st.columns([2,1])
 with colA:
-    st.subheader("Protocol (auto)")
-    st.code(json.dumps(prot or {}, ensure_ascii=False, indent=2), language="json")
+    st.subheader(t("protocol"))
+    st.code(json.dumps(prot, ensure_ascii=False, indent=2), language="json")
 with colB:
-    st.subheader("PubMed query (auto)")
+    st.subheader(t("pubmed_query"))
     st.code(pub_q or "", language="text")
 
-st.subheader("Diagnostics")
-with st.expander("Show diagnostics"):
+st.subheader(t("diagnostics"))
+with st.expander(t("show_diag")):
     st.write({"pubmed_total_count": int(st.session_state.get("pubmed_total") or 0)})
     st.write(diag)
 
-if scan and scan.get("summary"):
-    st.subheader("Feasibility: Existing SR/MA/NMA scan")
+if st.session_state.get("include_srma_scan", True) and scan and scan.get("summary"):
+    st.subheader(t("srma_title"))
     st.info(scan["summary"])
     hits = scan.get("hits", pd.DataFrame())
     if isinstance(hits, pd.DataFrame) and not hits.empty:
         st.dataframe(hits, use_container_width=True)
-        st.download_button("Download SR/MA/NMA hits (CSV)", data=to_csv_bytes(hits), file_name="srma_nma_hits.csv")
+        st.download_button(t("download_csv"), data=to_csv_bytes(hits), file_name="srma_nma_hits.csv")
 
-if isinstance(df, pd.DataFrame) and not df.empty:
-    st.subheader("Search summary")
-    ta_vals = [st.session_state["ta_final"].get(rid, "Unsure") for rid in df["record_id"].tolist()]
-    st.write({
-        "PubMed total count (query)": int(st.session_state.get("pubmed_total") or 0),
-        "Retrieved (dedup, limited by max_records)": int(len(df)),
-        "TA Include": int(sum(1 for x in ta_vals if x == "Include")),
-        "TA Exclude": int(sum(1 for x in ta_vals if x == "Exclude")),
-        "TA Unsure": int(sum(1 for x in ta_vals if x == "Unsure")),
-    })
-
-    st.subheader("Records (TA screening results)")
+st.subheader(t("records"))
+if isinstance(df, pd.DataFrame) and df.empty:
+    st.info(t("no_records"))
+else:
     merged = df.merge(scr, on="record_id", how="left")
     merged = ensure_cols(merged, ["AI_label","AI_reason","AI_confidence"], "")
-    merged["TA_final"] = merged["record_id"].map(lambda rid: st.session_state["ta_final"].get(rid, "Unsure"))
-    st.dataframe(merged[["record_id","year","first_author","title","AI_label","AI_reason","pmid","doi","pmcid","url","pmc_url"]], use_container_width=True)
-    st.download_button("Download records_with_screening.csv", data=to_csv_bytes(merged), file_name="records_with_screening.csv")
+    merged["TA_final"] = merged["record_id"].map(lambda rid: st.session_state["ta_final"].get(rid, t("ta_unsure")))
+    merged["FT_decision"] = merged["record_id"].map(lambda rid: st.session_state["ft_decision"].get(rid, t("ft_not")))
+    merged["FT_reason"] = merged["record_id"].map(lambda rid: st.session_state["ft_reason"].get(rid, ""))
 
+    st.dataframe(
+        merged[["record_id","year","first_author","title","AI_label","AI_reason","TA_final","FT_decision","pmid","doi","pmcid","url","pmc_url"]],
+        use_container_width=True
+    )
+    st.download_button(t("download_csv"), data=to_csv_bytes(merged), file_name="records_with_screening.csv")
+
+st.subheader(t("extraction_wide"))
 if isinstance(wide, pd.DataFrame) and not wide.empty:
-    st.subheader("Extraction wide table (editable)")
     edited = st.data_editor(wide, use_container_width=True, hide_index=True, num_rows="dynamic")
     st.session_state["extraction_wide"] = edited
-    st.download_button("Download extraction_wide.csv", data=to_csv_bytes(edited), file_name="extraction_wide.csv")
+    st.download_button(t("download_csv"), data=to_csv_bytes(edited), file_name="extraction_wide.csv")
+else:
+    st.caption(t("no_key_degrade"))
 
-st.subheader("ROB 2.0 (table)")
+st.subheader(t("rob2"))
 rob_rows = []
-if isinstance(wide, pd.DataFrame) and not wide.empty:
-    inc = wide[wide["FT_decision"] == "Include for meta-analysis"].copy()
-    for _, r in inc.iterrows():
+wide2 = st.session_state.get("extraction_wide", pd.DataFrame())
+if isinstance(wide2, pd.DataFrame) and not wide2.empty:
+    inc2 = wide2[wide2["FT_decision"] == t("ft_include")].copy()
+    for _, r in inc2.iterrows():
         rid = r["record_id"]
         rb = st.session_state["rob2_table"].get(rid, {}) or {}
         name = f"{r.get('first_author','')} ({r.get('year','')})".strip() or rid
@@ -1241,15 +1514,14 @@ if isinstance(wide, pd.DataFrame) and not wide.empty:
 rob_df = pd.DataFrame(rob_rows)
 if not rob_df.empty:
     st.dataframe(rob_df, use_container_width=True)
-    st.download_button("Download rob2.csv", data=to_csv_bytes(rob_df), file_name="rob2.csv")
+    st.download_button(t("download_csv"), data=to_csv_bytes(rob_df), file_name="rob2.csv")
 else:
-    st.caption("No FT included studies yet, or LLM not configured. ROB2 is drafted after FT inclusion.")
+    st.caption(t("rob2_note"))
 
-st.subheader("Meta-analysis (fixed effect)")
+st.subheader(t("ma"))
 if ma:
     if ma.get("error"):
-        st.warning(f"MA not available: {ma.get('error')}")
-        st.caption("Needs: FT_decision=Include for meta-analysis and Effect + CI in the wide table (usually from LLM extraction or manual entry).")
+        st.warning(t("ma_not_ready"))
     else:
         st.success(f"Pooled ({ma.get('measure')}): {ma.get('pooled'):.4g} (95% CI {ma.get('lower'):.4g} to {ma.get('upper'):.4g}), k={ma.get('k')}")
         if HAS_MPL:
@@ -1257,23 +1529,27 @@ if ma:
             if fig is not None:
                 st.pyplot(fig, clear_figure=True)
 
-st.subheader("PRISMA (draft counts)")
+st.subheader(t("prisma"))
+df3 = st.session_state.get("records", pd.DataFrame())
+ta_vals = [st.session_state["ta_final"].get(rid, t("ta_unsure")) for rid in (df3["record_id"].tolist() if isinstance(df3, pd.DataFrame) and not df3.empty else [])]
 prisma = {
     "Records identified (PubMed total count)": int(st.session_state.get("pubmed_total") or 0),
-    "Records retrieved (limited by max_records)": int(len(df)) if isinstance(df, pd.DataFrame) else 0,
-    "TA Include": int(sum(1 for rid in (df["record_id"].tolist() if isinstance(df, pd.DataFrame) and not df.empty else []) if st.session_state["ta_final"].get(rid) == "Include")),
-    "FT Include for MA": int(sum(1 for rid in (df["record_id"].tolist() if isinstance(df, pd.DataFrame) and not df.empty else []) if st.session_state["ft_decision"].get(rid) == "Include for meta-analysis")),
+    "Records retrieved (limited by max_records)": int(len(df3)) if isinstance(df3, pd.DataFrame) else 0,
+    "TA Include": int(sum(1 for x in ta_vals if x == t("ta_include"))),
+    "TA Exclude": int(sum(1 for x in ta_vals if x == t("ta_exclude"))),
+    "TA Unsure": int(sum(1 for x in ta_vals if x == t("ta_unsure"))),
+    "FT Include for meta-analysis": int(sum(1 for rid in (df3["record_id"].tolist() if isinstance(df3, pd.DataFrame) and not df3.empty else []) if st.session_state["ft_decision"].get(rid) == t("ft_include"))),
 }
 st.json(prisma)
 
-st.subheader("Export Word (draft)")
-if HAS_DOCX and prot and isinstance(wide, pd.DataFrame):
+st.subheader(t("export_word"))
+if HAS_DOCX and prot and isinstance(st.session_state.get("extraction_wide", pd.DataFrame()), pd.DataFrame):
     docx_bytes = export_docx(
         question=st.session_state.get("question",""),
         protocol=prot,
         pubmed_query=pub_q,
         prisma=prisma,
-        wide=wide,
+        wide=st.session_state.get("extraction_wide", pd.DataFrame()),
         rob_df=rob_df,
         ma=ma if ma and not ma.get("error") else None
     )
@@ -1285,4 +1561,4 @@ if HAS_DOCX and prot and isinstance(wide, pd.DataFrame):
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         )
 else:
-    st.caption("Word export requires python-docx.")
+    st.caption(t("word_missing"))
