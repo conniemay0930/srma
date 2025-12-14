@@ -1360,3 +1360,103 @@ if st.session_state.get("question"):
     with tabs[6]:
         st.markdown("### Diagnostics")
         st.code(json.dumps(diag, ensure_ascii=False, indent=2), language="json")
+# -------------------- Step 7 Manuscript draft --------------------
+    with tabs[8]:
+        st.markdown("### Step 7：稿件草稿（分段呈現；可 BYOK 生成）")
+        st.caption("未能自動推論或需要你補的地方會用『』占位；請務必人工核對與改寫。")
+
+        # Minimal draft template (always available)
+        pr = compute_prisma(df) if df is not None and not df.empty else {}
+        n_id = pr.get("records_identified", "—")
+        n_inc = pr.get("studies_included", "—")
+        n_meta = pr.get("included_meta", "—")
+
+        default_intro = (
+            "【Introduction】\n"
+            "『背景：此領域臨床上重要的未解問題與現有證據不足之處』\n"
+            f"本研究旨在比較『{st.session_state.get('question','')}』相關介入之臨床結果，並以系統性回顧與統合分析整合現有證據。\n"
+        )
+
+        default_methods = (
+            "【Methods】\n"
+            "本研究遵循 PRISMA 流程。\n"
+            f"檢索來源：PubMed（搜尋式見附錄/Step 1）。\n"
+            "納入標準：『族群/研究設計/介入與比較/outcome/追蹤時間』\n"
+            "排除標準：動物/體外/病例報告等（並依題目調整）。\n"
+            "篩選流程：Title/Abstract 粗篩後進行全文評讀；分歧以討論解決。\n"
+            "資料萃取：以寬表蒐集 effect 與 95% CI（必要時由原文推算）。\n"
+            "偏倚風險：採 ROB 2.0，並記錄各 domain 與 overall 的理由。\n"
+            "統計方法：以固定效應或隨機效應模型進行統合分析；異質性以 I² 評估。\n"
+        )
+
+        default_results = (
+            "【Results】\n"
+            f"共檢索到 {n_id} 筆紀錄，最終納入 {n_inc} 篇研究；其中 {n_meta} 篇具備可用數據納入統合分析（詳 PRISMA）。\n"
+            "主要結局：『Outcome_label、效應量、95% CI、I²』\n"
+            "次要結局：『……』\n"
+        )
+
+        default_disc = (
+            "【Discussion】\n"
+            "本研究整合現有證據，顯示『主要發現與臨床意義』。\n"
+            "可能機轉：『……』\n"
+            "限制：研究數量、異質性、測量差異、偏倚風險、出版偏倚等。\n"
+            "未來研究：建議更多高品質 RCT/一致 outcome 報告。\n"
+        )
+
+        default_other = (
+            "【結論】\n"
+            "『一句話總結主要結論與臨床含意；避免過度推論。』\n\n"
+            "【關鍵字】\n"
+            "『3–6 個 keywords』\n\n"
+            "【附錄：PubMed 搜尋式】\n"
+            f"{st.session_state.get('pubmed_query','')}\n"
+        )
+
+        # Show + optional AI generation
+        st.markdown("#### 手動模板（一定有）")
+        intro = st.text_area("Introduction", value=st.session_state["ms_sections"].get("intro", default_intro), height=170)
+        methods = st.text_area("Methods", value=st.session_state["ms_sections"].get("methods", default_methods), height=220)
+        results = st.text_area("Results", value=st.session_state["ms_sections"].get("results", default_results), height=170)
+        discussion = st.text_area("Discussion", value=st.session_state["ms_sections"].get("discussion", default_disc), height=190)
+        other = st.text_area("Conclusion/Keywords/Appendix", value=st.session_state["ms_sections"].get("other", default_other), height=210)
+
+        if st.button("儲存草稿"):
+            st.session_state["ms_sections"]["intro"] = intro
+            st.session_state["ms_sections"]["methods"] = methods
+            st.session_state["ms_sections"]["results"] = results
+            st.session_state["ms_sections"]["discussion"] = discussion
+            st.session_state["ms_sections"]["other"] = other
+            st.success("已儲存草稿。")
+
+        st.markdown("<hr class='hr'/>", unsafe_allow_html=True)
+        st.markdown("#### AI 生成（可選；需 BYOK）")
+        if not llm_available():
+            st.info("未啟用 BYOK：此區塊自動降級（不會卡住）。")
+        else:
+            if st.button("用 LLM 生成/改寫草稿（保持學術口吻，缺失用『』）"):
+                with st.spinner("LLM 生成中…"):
+                    sys = (
+                        "你是資深眼科/臨床研究寫作助理。請用繁體中文撰寫一篇系統性回顧與統合分析的稿件草稿，"
+                        "分段輸出 Introduction/Methods/Results/Discussion/Conclusion/Keywords/Appendix。"
+                        "若資料不足或需要作者補充，請用全形括號『』留下待填欄位，不得捏造數據或引用。"
+                    )
+                    payload = {
+                        "question": st.session_state.get("question",""),
+                        "pubmed_query": st.session_state.get("pubmed_query",""),
+                        "prisma": compute_prisma(df) if df is not None else {},
+                        "notes": "請保守，避免過度推論；引用請用『待補引用』標示。"
+                    }
+                    try:
+                        content = call_openai_compatible(
+                            [{"role":"system","content":sys},{"role":"user","content":json.dumps(payload, ensure_ascii=False)}],
+                            max_tokens=1900
+                        )
+                        st.text_area("LLM 輸出（請務必人工核對）", value=content, height=420)
+                    except Exception as e:
+                        st.error(f"LLM 呼叫失敗：{e}")
+
+    # -------------------- Diagnostics --------------------
+    with tabs[9]:
+        st.markdown("### Diagnostics")
+        st.code(json.dumps(diag, ensure_ascii=False, indent=2), language="json")
