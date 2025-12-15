@@ -136,7 +136,7 @@ I18N = {
         "tabs_overview": "總覽（PRISMA）",
         "tabs_step1": "Step 1 搜尋式（可手改）",
         "tabs_step2": "Step 2 可行性（SR/MA/NMA）",
-        "tabs_step34": "Step 3+4 Records + 粗篩",
+        "tabs_step34": "Step 3+4 Records + 粗篩（合併）",
         "tabs_ft": "Step 4b Full text review",
         "tabs_extract": "Step 5 Data extraction（寬表）",
         "tabs_ma": "Step 6 MA + 森林圖",
@@ -287,71 +287,19 @@ def json_from_text(s: str) -> Optional[dict]:
     return None
 
 def format_abstract(text: str) -> str:
-    """Pretty-print PubMed abstracts.
-
-    Goals:
-    - Keep paragraphs readable (avoid '擠在一起').
-    - If structured headings exist, normalize to:
-      Purpose： / Methods： / Result： / Discussion：
-    """
     t0 = (text or "").strip()
     if not t0:
         return ""
-
-    # Normalize whitespace
     t0 = re.sub(r"\s*\n\s*", "\n", t0)
-    t0 = re.sub(r"[ \t]+", " ", t0)
-
-    # Insert section breaks for common structured headings
-    # Accept both ':' and '：'
-    headings = (
-        "PURPOSE|OBJECTIVE|AIM|BACKGROUND|METHODS|MATERIALS AND METHODS|RESULTS|CONCLUSIONS|CONCLUSION|DISCUSSION"
-    )
     t0 = re.sub(
-        rf"(?<!\n)\b({headings})\s*[:：]\s*",
+        r"(?<!\n)\b(PURPOSE|METHODS|RESULTS|CONCLUSIONS|CONCLUSION|BACKGROUND|DESIGN|SETTING|PATIENTS|INTERVENTION|MAIN OUTCOME MEASURES|IMPORTANCE|OBJECTIVE|DATA SOURCES|STUDY SELECTION|DATA EXTRACTION|LIMITATIONS)\s*:\s*",
         r"\n\n\1: ",
         t0,
         flags=re.IGNORECASE,
     )
-
-    # If still a single long paragraph, split on sentence boundaries
     if "\n" not in t0 and len(t0) > 800:
         t0 = re.sub(r"(?<=\.)\s+(?=[A-Z])", "\n\n", t0)
-
-    # Normalize headings to the 4 labels requested (Traditional Chinese punctuation)
-    # Map: Objective/Aim/Background -> Purpose；Conclusions -> Discussion (if no explicit Discussion)
-    lines = []
-    for block in t0.split("\n\n"):
-        b = block.strip()
-        if not b:
-            continue
-        m = re.match(r"^(?P<h>[A-Za-z ]+)\s*:\s*(?P<body>.*)$", b, flags=re.DOTALL)
-        if m:
-            h = m.group("h").strip().lower()
-            body = m.group("body").strip()
-            if h in ["purpose", "objective", "aim", "background"]:
-                label = "Purpose："
-            elif h in ["methods", "materials and methods"]:
-                label = "Methods："
-            elif h in ["results", "result"]:
-                label = "Result："
-            elif h in ["discussion", "conclusion", "conclusions"]:
-                label = "Discussion："
-            else:
-                label = None
-
-            if label:
-                # Use bold label for readability in Streamlit markdown
-                lines.append(f"**{label}** {body}" if body else f"**{label}**")
-            else:
-                lines.append(b)
-        else:
-            lines.append(b)
-
-    out = "\n\n".join(lines).strip()
-
-    # If we converted Conclusions to Discussion and also already have Discussion, keep both as separate paras
-    return out
+    return t0.strip()
 
 def badge(label: str) -> str:
     label = label or "Unsure"
@@ -1862,16 +1810,7 @@ with tabs[3]:
             ]
             st.dataframe(view, use_container_width=True, hide_index=True)
         else:
-            # 分區顯示：依「AI 建議」自動分成 Include / Unsure / Exclude，方便快速瀏覽
-            groups = {"Include": [], "Unsure": [], "Exclude": []}
             for _, r in df.iterrows():
-                pmid0 = str(r.get("PMID", "") or "").strip()
-                ai0 = (st.session_state.get("ta_ai", {}) or {}).get(pmid0, "Unsure") or "Unsure"
-                if ai0 not in groups:
-                    ai0 = "Unsure"
-                groups[ai0].append(r)
-
-            def render_record_card(r):
                 pmid = str(r.get("PMID", "") or "").strip()
                 title = str(r.get("Title", "") or "").strip()
                 abstract = str(r.get("Abstract", "") or "")
@@ -1882,15 +1821,12 @@ with tabs[3]:
                 pmcid = str(r.get("PMCID", "") or "").strip()
                 pubtypes = str(r.get("PublicationTypes", "") or "").strip()
 
-                ai_lbl = (st.session_state.get("ta_ai", {}) or {}).get(pmid, "Unsure") or "Unsure"
-                ai_reason = (st.session_state.get("ta_ai_reason", {}) or {}).get(pmid, "")
-                try:
-                    ai_conf = float((st.session_state.get("ta_ai_conf", {}) or {}).get(pmid, 0.5) or 0.5)
-                except Exception:
-                    ai_conf = 0.5
+                ai_lbl = st.session_state.get("ta_ai", {}).get(pmid, "Unsure")
+                ai_reason = st.session_state.get("ta_ai_reason", {}).get(pmid, "")
+                ai_conf = float(st.session_state.get("ta_ai_conf", {}).get(pmid, 0.5) or 0.5)
 
-                ov = (st.session_state.get("ta_override", {}) or {}).get(pmid, "")
-                ov_reason = (st.session_state.get("ta_override_reason", {}) or {}).get(pmid, "")
+                ov = st.session_state.get("ta_override", {}).get(pmid, "")
+                ov_reason = st.session_state.get("ta_override_reason", {}).get(pmid, "")
                 final_lbl = ov if ov else ai_lbl
 
                 head = f"PMID:{pmid or '—'}｜{short(title or '—', 110)}"
@@ -1908,25 +1844,32 @@ with tabs[3]:
                         links.append(f"[DOI]({maybe_ezproxy(doi_link(doi))})")
                     if pmcid:
                         links.append(f"[PMC]({maybe_ezproxy(pmc_link(pmcid))})")
+                    if resolver_url(doi, pmid):
+                        links.append(f"[學院全文(OpenURL)]({resolver_url(doi, pmid)})")
                     if links:
                         st.markdown(" | ".join(links))
 
                     st.markdown(
-                        f"AI 建議：{badge_html(ai_lbl)}　<span class='small'>信心度：{ai_conf:.2f}</span>",
+                        f"{badge(final_lbl)} <span class='small'>Effective decision</span>"
+                        f"&nbsp;&nbsp;{badge(ai_lbl)} <span class='small'>AI Title/Abstract 建議</span>"
+                        f"&nbsp;&nbsp;<span class='small'>信心度：{ai_conf:.2f}</span>",
                         unsafe_allow_html=True,
                     )
                     if ai_reason:
-                        st.markdown(f"<div class='small'>理由：{html.escape(ai_reason)}</div>", unsafe_allow_html=True)
+                        st.write("理由：" + ai_reason)
 
                     if pubtypes:
-                        st.markdown(f"<div class='small'>Publication type: {html.escape(pubtypes)}</div>", unsafe_allow_html=True)
+                        st.caption("Publication types: " + pubtypes)
 
+                    st.markdown("<hr class='hr'/>", unsafe_allow_html=True)
+
+                    # Abstract (paragraph separated)
                     st.markdown("#### Abstract")
                     abs_fmt = format_abstract(abstract)
                     if abs_fmt:
                         for para in abs_fmt.split("\n\n"):
                             if para.strip():
-                                st.markdown(para.strip())
+                                st.write(para.strip())
                     else:
                         st.caption("_No abstract available._")
 
@@ -1955,15 +1898,7 @@ with tabs[3]:
 
                     st.markdown("</div>", unsafe_allow_html=True)
 
-            # Render by groups (AI suggestion)
-            for lbl in ["Include", "Unsure", "Exclude"]:
-                items = groups.get(lbl, [])
-                st.markdown(f"### {badge_html(lbl)} {lbl}（{len(items)}）", unsafe_allow_html=True)
-                if not items:
-                    st.caption("(none)")
-                for r in items:
-                    render_record_card(r)
-
+# =========================================================
 # Tab 4: Step 4b Full text review (decisions + reasons + PDF upload)
 # =========================================================
 FULLTEXT_EXCLUSION_REASONS = [
@@ -2373,58 +2308,19 @@ with tabs[7]:
                 with st.expander("BYOK：AI 建議 ROB 2.0（需全文文字；請人工核對）", expanded=False):
                     ft_text = st.session_state.get("ft_text", {}).get(pmid, "")
                     if not ft_text.strip():
-                        st.info("此篇尚無 full-text text。請先在 Step 4b 上傳 PDF 抽字或貼上全文（或貼上 Methods/Results）。")
+                        st.info("此篇尚無 full-text text。請先在 Step 4b 上傳 PDF 抽字或貼上全文。")
                     else:
-                        st.session_state.setdefault("rob2_ai", {})
-                        existing = st.session_state["rob2_ai"].get(pmid)
-
-                        if existing:
-                            st.caption("已存在 AI 建議（如下）。你也可以按下方按鈕重新產生。")
-                            st.json(existing)
-
-                        if st.button("Generate / Refresh ROB2 suggestion", key=f"rob2_ai_{pmid}"):
+                        if st.button("Generate ROB2 suggestion", key=f"rob2_ai_{pmid}"):
                             sys = (
-                                "You are an evidence synthesis methodologist. "
-                                "Assess Cochrane RoB 2.0 for an RCT based on the provided full text. "
-                                "Return STRICT JSON only (no markdown). "
-                                "Required keys: "
+                                "You are assessing Cochrane RoB 2.0 for an RCT based on full text. "
+                                "Return STRICT JSON with keys: "
                                 "Randomization process, Deviations from intended interventions, Missing outcome data, "
                                 "Measurement of the outcome, Selection of the reported result, Overall, Rationale. "
-                                "Each domain value must be exactly one of: Low, Some concerns, High, Unclear. "
-                                "Rationale should be short, cite concrete signals from the text."
+                                "Each domain value must be one of: Low / Some concerns / High / Unclear, and provide short rationale."
                             )
-                            user = json.dumps(
-                                {
-                                    "pmid": pmid,
-                                    "title": title,
-                                    "year": year,
-                                    "journal": journal,
-                                    "full_text": ft_text[:20000],
-                                },
-                                ensure_ascii=False,
-                            )
-                            d = llm_json(sys, user, max_tokens=1400)
-                            if not d:
-                                st.warning("AI 未回傳可解析的 JSON（或未啟用 LLM）。請確認 sidebar 已填入可用的 API key / Base URL / Model。")
-                            else:
-                                st.session_state["rob2_ai"][pmid] = d
-                                # Auto-fill the manual ROB form (will take effect on next rerun)
-                                rob_now = (st.session_state.get("rob2", {}) or {}).get(pmid, {}) or {}
-                                for dom in ROB_DOMAINS:
-                                    v = d.get(dom)
-                                    if isinstance(v, str) and v in ROB_LEVELS:
-                                        rob_now[dom] = v
-                                ov = d.get("Overall")
-                                if isinstance(ov, str) and ov in ROB_LEVELS:
-                                    rob_now["Overall"] = ov
-                                rat = d.get("Rationale")
-                                if isinstance(rat, str) and rat.strip():
-                                    rob_now["Rationale"] = rat.strip()
-                                st.session_state.setdefault("rob2", {})
-                                st.session_state["rob2"][pmid] = rob_now
-                                st.success("已將 AI 建議寫入此篇 ROB 2.0 表單（你仍可在上方手動調整）。")
-                                st.json(d)
-
+                            user = json.dumps({"full_text": ft_text[:16000]}, ensure_ascii=False)
+                            d = llm_json(sys, user, max_tokens=1200) or {}
+                            st.json(d)
 
 # =========================================================
 # Tab 8: Manuscript (sections shown + optional BYOK) + export
