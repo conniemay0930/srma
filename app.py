@@ -114,7 +114,7 @@ I18N = {
     "zh-TW": {
         "app_title": "一句話帶你完成 MA",
         "author": "作者：Ya Hsin Yao",
-        "lang_label": "語言",
+        "lang_label": "介面語言",
         "tips_title": "小叮嚀／注意事項",
         "byok_title": "LLM（使用者自備 key）",
         "byok_toggle": "啟用 LLM（使用者自備 key）",
@@ -171,7 +171,7 @@ I18N = {
     "en": {
         "app_title": "From one question to Meta-analysis",
         "author": "Author: Ya Hsin Yao",
-        "lang_label": "Language",
+        "lang_label": "Interface language",
         "tips_title": "Notes / Warnings",
         "byok_title": "LLM (Bring Your Own Key)",
         "byok_toggle": "Enable LLM (BYOK)",
@@ -502,7 +502,13 @@ def llm_json(system: str, user: str, max_tokens: int = 1200) -> Optional[dict]:
 # =========================================================
 with st.sidebar:
     st.header(t("settings"))
-    st.selectbox(t("lang_label"), options=["zh-TW", "en"], index=(0 if st.session_state["UI_LANG"] == "zh-TW" else 1), key="UI_LANG")
+    st.selectbox(
+        t("lang_label"),
+        options=["zh-TW", "en"],
+        index=(0 if st.session_state.get("UI_LANG","zh-TW") == "zh-TW" else 1),
+        key="UI_LANG",
+        format_func=lambda x: ("繁體中文" if x == "zh-TW" else "English"),
+    )
 
     with st.expander(t("tips_title"), expanded=False):
         st.markdown(
@@ -1543,18 +1549,24 @@ with tabs[2]:
 with tabs[3]:
     st.subheader(t("tabs_step34"))
     df = st.session_state.get("pubmed_records")
+
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         st.info(t("records_none"))
     else:
-        df = ensure_columns(df.copy(), ["PMID","Title","Abstract","Year","First_author","Journal","DOI","PMCID","PublicationTypes"], default="")
-        st.caption("每篇文獻含：PMID/DOI/Year/First author/Journal、PubMed/DOI/PMC/EZproxy、AI 建議與信心度、以及人工 override。")
+        # Ensure stable columns (avoid KeyError when upstream schema changes)
+        df = ensure_columns(
+            df.copy(),
+            ["PMID", "Title", "Abstract", "Year", "First_author", "Journal", "DOI", "PMCID", "PublicationTypes"],
+            default="",
+        )
+        st.caption("每篇文獻含：PMID/DOI/Year/First author/Journal、PubMed/DOI/PMC/學院全文(OpenURL/EZproxy)、AI 建議與信心度、以及人工 override（可稽核）。")
 
         # Bulk tools
-        c1, c2, c3 = st.columns([1,1,2])
+        c1, c2, c3, c4 = st.columns([1, 1, 1.1, 2.2])
         with c1:
             if st.button("Override all Unsure → Include"):
                 for pmid in df["PMID"].astype(str).tolist():
-                    if st.session_state.get("ta_ai",{}).get(pmid,"Unsure") == "Unsure":
+                    if st.session_state.get("ta_ai", {}).get(pmid, "Unsure") == "Unsure":
                         st.session_state["ta_override"][pmid] = "Include"
                         st.session_state["ta_override_reason"][pmid] = "Batch override: keep for full text."
         with c2:
@@ -1562,37 +1574,47 @@ with tabs[3]:
                 st.session_state["ta_override"] = {}
                 st.session_state["ta_override_reason"] = {}
         with c3:
+            view_mode = st.radio("顯示方式", options=["卡片", "表格（精簡）"], horizontal=True, index=0, key="view_mode_step34")
+        with c4:
             st.write("")
 
-        show_cards = st.session_state.get("show_record_cards", True)
+        show_cards = (st.session_state.get("view_mode_step34", "卡片") == "卡片")
+
         if not show_cards:
-            # Compact table view
-            view = df[["PMID","Year","First_author","Journal","Title"]].copy()
-            view["AI"] = [st.session_state.get("ta_ai",{}).get(str(p),"") for p in view["PMID"].astype(str)]
-            st.dataframe(view, use_container_width=True)
+            view = df[["PMID", "Year", "First_author", "Journal", "Title"]].copy()
+            view["AI_suggest"] = [st.session_state.get("ta_ai", {}).get(str(p), "") for p in view["PMID"].astype(str)]
+            view["Final"] = [
+                (st.session_state.get("ta_override", {}).get(str(p), "") or st.session_state.get("ta_ai", {}).get(str(p), ""))
+                for p in view["PMID"].astype(str)
+            ]
+            st.dataframe(view, use_container_width=True, hide_index=True)
         else:
             for _, r in df.iterrows():
-                pmid = str(r["PMID"])
-                title = r["Title"]
-                abst = format_abstract(r["Abstract"])
-                year = r["Year"]
-                fa = r["First_author"]
-                journal = r["Journal"]
-                doi = r.get("DOI","")
-                pmcid = r.get("PMCID","")
-                pubtypes = r.get("PublicationTypes","")
+                pmid = str(r.get("PMID", "") or "").strip()
+                title = str(r.get("Title", "") or "").strip()
+                abstract = str(r.get("Abstract", "") or "")
+                year = str(r.get("Year", "") or "").strip()
+                fa = str(r.get("First_author", "") or "").strip()
+                journal = str(r.get("Journal", "") or "").strip()
+                doi = str(r.get("DOI", "") or "").strip()
+                pmcid = str(r.get("PMCID", "") or "").strip()
+                pubtypes = str(r.get("PublicationTypes", "") or "").strip()
 
-                ai_lbl = st.session_state.get("ta_ai",{}).get(pmid,"Unsure")
-                ai_reason = st.session_state.get("ta_ai_reason",{}).get(pmid,"")
-                ai_conf = st.session_state.get("ta_ai_conf",{}).get(pmid,0.5)
-                ov = st.session_state.get("ta_override",{}).get(pmid,"")
+                ai_lbl = st.session_state.get("ta_ai", {}).get(pmid, "Unsure")
+                ai_reason = st.session_state.get("ta_ai_reason", {}).get(pmid, "")
+                ai_conf = float(st.session_state.get("ta_ai_conf", {}).get(pmid, 0.5) or 0.5)
+
+                ov = st.session_state.get("ta_override", {}).get(pmid, "")
+                ov_reason = st.session_state.get("ta_override_reason", {}).get(pmid, "")
                 final_lbl = ov if ov else ai_lbl
 
-                with st.container():
+                head = f"PMID:{pmid or '—'}｜{short(title or '—', 110)}"
+                with st.expander(head, expanded=False):
                     st.markdown("<div class='card'>", unsafe_allow_html=True)
-                    meta = f"PMID: {pmid} | Year: {year or '—'} | First author: {fa or '—'} | Journal: {journal or '—'}"
+
+                    meta = f"PMID: {pmid or '—'}　|　DOI: {doi or '—'}　|　Year: {year or '—'}　|　First author: {fa or '—'}　|　Journal: {journal or '—'}"
                     st.markdown(f"**{title or '—'}**")
-                    st.markdown(f"<span class='small'>{meta}</span>", unsafe_allow_html=True)
+                    st.markdown(f"<div class='small'>{meta}</div>", unsafe_allow_html=True)
 
                     links = []
                     if pubmed_link(pmid):
@@ -1602,44 +1624,56 @@ with tabs[3]:
                     if pmcid:
                         links.append(f"[PMC]({maybe_ezproxy(pmc_link(pmcid))})")
                     if resolver_url(doi, pmid):
-                        links.append(f"[學院全文連結]({resolver_url(doi, pmid)})")
+                        links.append(f"[學院全文(OpenURL)]({resolver_url(doi, pmid)})")
                     if links:
                         st.markdown(" | ".join(links))
 
-                    # AI suggestion
-                    st.markdown(f"AI 建議：{badge(ai_lbl)}　信心度：{ai_conf:.2f}", unsafe_allow_html=True)
+                    st.markdown(
+                        f"{badge(final_lbl)} <span class='small'>Effective decision</span>"
+                        f"&nbsp;&nbsp;{badge(ai_lbl)} <span class='small'>AI Title/Abstract 建議</span>"
+                        f"&nbsp;&nbsp;<span class='small'>信心度：{ai_conf:.2f}</span>",
+                        unsafe_allow_html=True,
+                    )
                     if ai_reason:
                         st.write("理由：" + ai_reason)
+
                     if pubtypes:
                         st.caption("Publication types: " + pubtypes)
 
-                    # Abstract
-                    if abst:
-                        st.markdown("**Abstract**")
-                        for para in abst.split("\n\n"):
-                            st.write(para.strip())
+                    st.markdown("<hr class='hr'/>", unsafe_allow_html=True)
+
+                    # Abstract (paragraph separated)
+                    st.markdown("#### Abstract")
+                    abs_fmt = format_abstract(abstract)
+                    if abs_fmt:
+                        for para in abs_fmt.split("\n\n"):
+                            if para.strip():
+                                st.write(para.strip())
                     else:
-                        st.caption("No abstract available.")
+                        st.caption("_No abstract available._")
+
+                    st.markdown("<hr class='hr'/>", unsafe_allow_html=True)
 
                     # Override
-                    cA, cB = st.columns([1,2])
-                    with cA:
-                        choice = st.radio(
-                            f"Final decision (Title/Abstract) — {pmid}",
-                            options=["(use AI)", "Include", "Exclude", "Unsure"],
-                            index=0 if not ov else ["(use AI)","Include","Exclude","Unsure"].index(ov),
-                            key=f"ta_override_radio_{pmid}",
-                            horizontal=True,
-                        )
-                        if choice == "(use AI)":
-                            st.session_state["ta_override"].pop(pmid, None)
-                        else:
-                            st.session_state["ta_override"][pmid] = choice
-                    with cB:
-                        rs = st.text_input("Override reason (optional)", value=st.session_state.get("ta_override_reason",{}).get(pmid,""),
-                                           key=f"ta_override_reason_{pmid}")
-                        if pmid in st.session_state.get("ta_override",{}):
-                            st.session_state["ta_override_reason"][pmid] = rs
+                    st.markdown("#### 人工修正（override）")
+                    choice = st.radio(
+                        f"Final decision (Title/Abstract) — PMID：{pmid or '—'}",
+                        options=["(use AI)", "Include", "Exclude", "Unsure"],
+                        index=0 if not ov else ["(use AI)", "Include", "Exclude", "Unsure"].index(ov),
+                        key=f"ta_override_radio_{pmid}",
+                        horizontal=True,
+                    )
+                    if choice == "(use AI)":
+                        st.session_state["ta_override"].pop(pmid, None)
+                    else:
+                        st.session_state["ta_override"][pmid] = choice
+
+                    st.session_state["ta_override_reason"][pmid] = st.text_area(
+                        "Override reason（可留空；建議寫清楚入/排原因，方便 full text review 與 PRISMA）",
+                        value=ov_reason,
+                        key=f"ta_override_reason_{pmid}",
+                        height=85,
+                    )
 
                     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -1837,7 +1871,7 @@ with tabs[5]:
             st.session_state["extract_schema_text"] = default_extraction_schema()
 
         st.markdown("#### " + t("extract_schema"))
-        st.caption("學長要求：extraction table 不要寫死 → 在 PICO 層級自主規劃欄位。你可自行增刪欄位，並考量：既有 SR/MA/NMA、既有 RCT 的 primary/secondary outcomes。")
+        st.caption("目標要求：extraction table 不要寫死 → 在 PICO 層級自主規劃欄位。你可自行增刪欄位，並考量：既有 SR/MA/NMA、既有 RCT 的 primary/secondary outcomes。")
         schema_text = st.text_area("", key="extract_schema_text", height=170)
 
         schema_cols = [c.strip() for c in (schema_text or "").splitlines() if c.strip()]
@@ -2136,4 +2170,5 @@ with tabs[9]:
     if diag.get("efetch_urls"):
         st.write("efetch_urls:")
         st.code("\n".join(diag["efetch_urls"]), language="text")
+
 
