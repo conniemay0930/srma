@@ -2129,19 +2129,30 @@ with tabs[5]:
         # Eligible studies: those included for MA (full-text)
         kept_df = ensure_columns(df.copy(), ["PMID","Title","First_author","Year"], default="")
         include_pmids = [pmid for pmid, dec in (st.session_state.get("ft_decision") or {}).items() if dec == "Include for meta-analysis"]
-        if not include_pmids:
-            st.warning("目前沒有 Full-text decision = Include for meta-analysis 的研究；你仍可先建立 extraction 表，但建議先在 Step 4b 做決策。")
+
+        # 僅顯示 Full-text = Include for meta-analysis（符合 MA 抽取流程）
+        pool_df = kept_df.copy()
+        if include_pmids:
+            pool_df = kept_df[kept_df["PMID"].astype(str).isin(set(map(str, include_pmids)))].copy()
+        else:
+            st.warning("目前沒有 Full-text decision = Include for meta-analysis 的研究；請先到 Step 4b 完成全文決策。")
+            # 進階：允許先用粗篩納入建立抽取表（預設關閉，避免與規範不一致）
+            allow_pre_ft = st.checkbox("（進階）尚未完成 Full text 時，暫時顯示 Title/Abstract 納入以先建立抽取表", value=False, key="step5_allow_pre_ft")
+            if allow_pre_ft:
+                pool_df = kept_df.copy()
+            else:
+                pool_df = kept_df.iloc[0:0].copy()
 
         options = []
         pmid_to_row = {}
-        for _, r in kept_df.iterrows():
+        for _, r in pool_df.iterrows():
             pmid = str(r["PMID"])
             label = f"{pmid} | {r['First_author']} | {short(r['Title'], 60)}"
             pmid_to_row[label] = r.to_dict()
             options.append(label)
 
         with st.form("quick_add_form"):
-            pick = st.selectbox("Choose record", options=options, index=0 if options else 0)
+            pick = st.selectbox("Choose record", options=options if options else ["（無可用研究：請先在 Step 4b 設為 Include for meta-analysis）"], index=0)
             picked = pmid_to_row.get(pick, {})
             st.write(f"Selected: PMID={picked.get('PMID','')} | First author={picked.get('First_author','')} | Year={picked.get('Year','')}")
             # minimal fields
