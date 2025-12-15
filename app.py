@@ -32,41 +32,12 @@ import pandas as pd
 import streamlit as st
 import xml.etree.ElementTree as ET
 
-# Optional: PDF text extraction (best-effort; avoids hard dependency)
-HAS_PYPDF2 = False
-HAS_PYPDF = False
-HAS_PDFPLUMBER = False
-HAS_FITZ = False
-
-PdfReader = None  # will be set if any PDF reader library is available
-
+# Optional: PDF text extraction
 try:
-    from PyPDF2 import PdfReader as _PdfReader  # type: ignore
-    PdfReader = _PdfReader
+    from PyPDF2 import PdfReader  # type: ignore
     HAS_PYPDF2 = True
 except Exception:
-    pass
-
-try:
-    from pypdf import PdfReader as _PdfReader2  # type: ignore
-    if PdfReader is None:
-        PdfReader = _PdfReader2
-    HAS_PYPDF = True
-except Exception:
-    pass
-
-try:
-    import pdfplumber  # type: ignore
-    HAS_PDFPLUMBER = True
-except Exception:
-    pdfplumber = None  # type: ignore
-
-try:
-    import fitz  # type: ignore  # PyMuPDF
-    HAS_FITZ = True
-except Exception:
-    fitz = None  # type: ignore
-
+    HAS_PYPDF2 = False
 
 # Optional: Plotly for forest plot
 try:
@@ -165,7 +136,7 @@ I18N = {
         "tabs_overview": "總覽（PRISMA）",
         "tabs_step1": "Step 1 搜尋式（可手改）",
         "tabs_step2": "Step 2 可行性（SR/MA/NMA）",
-        "tabs_step34": "Step 3+4 Records + 粗篩",
+        "tabs_step34": "Step 3+4 Records + 粗篩（合併）",
         "tabs_ft": "Step 4b Full text review",
         "tabs_extract": "Step 5 Data extraction（寬表）",
         "tabs_ma": "Step 6 MA + 森林圖",
@@ -316,48 +287,19 @@ def json_from_text(s: str) -> Optional[dict]:
     return None
 
 def format_abstract(text: str) -> str:
-    """Best-effort abstract formatting for readability.
-
-    - Collapse hard-wrapped newlines to paragraphs
-    - Preserve existing paragraphs when possible
-    - Add blank lines before common structured headings (Purpose/Methods/Results/Discussion/Conclusions, etc.)
-    """
-    t = (text or "").replace("\r", "\n").strip()
-    if not t:
+    t0 = (text or "").strip()
+    if not t0:
         return ""
-
-    # Normalize excessive newlines
-    t = re.sub(r"\n{3,}", "\n\n", t)
-
-    # If the abstract looks hard-wrapped (many single newlines), merge them into spaces
-    # while preserving paragraph breaks.
-    t = t.replace("\n\n", "<PARA>")
-    t = re.sub(r"\n+", " ", t)  # merge remaining newlines
-    t = t.replace("<PARA>", "\n\n")
-    t = re.sub(r"\s+", " ", t)
-    t = re.sub(r"\s*\n\s*", "\n", t).strip()
-
-    # Insert paragraph breaks before common structured headings
-    headings = [
-        "PURPOSE", "OBJECTIVE", "AIM", "BACKGROUND",
-        "METHODS", "METHOD",
-        "RESULTS", "RESULT",
-        "DISCUSSION",
-        "CONCLUSIONS", "CONCLUSION",
-        "DESIGN", "SETTING", "PATIENTS", "INTERVENTION",
-        "MAIN OUTCOME MEASURES", "IMPORTANCE",
-        "DATA SOURCES", "STUDY SELECTION", "DATA EXTRACTION", "LIMITATIONS",
-    ]
-    # Make sure we only split when it is used as a heading with a colon.
-    h = "|".join([re.escape(x) for x in headings])
-    t = re.sub(rf"(?i)(?<!\n\n)\b({h})\s*:\s*", r"\n\n\1: ", t)
-
-    # If still a single long paragraph, split into paragraphs by sentence boundary (light touch)
-    if "\n" not in t and len(t) > 900:
-        t = re.sub(r"(?<=\.)\s+(?=[A-Z])", "\n\n", t)
-
-    return t.strip()
-
+    t0 = re.sub(r"\s*\n\s*", "\n", t0)
+    t0 = re.sub(
+        r"(?<!\n)\b(PURPOSE|METHODS|RESULTS|CONCLUSIONS|CONCLUSION|BACKGROUND|DESIGN|SETTING|PATIENTS|INTERVENTION|MAIN OUTCOME MEASURES|IMPORTANCE|OBJECTIVE|DATA SOURCES|STUDY SELECTION|DATA EXTRACTION|LIMITATIONS)\s*:\s*",
+        r"\n\n\1: ",
+        t0,
+        flags=re.IGNORECASE,
+    )
+    if "\n" not in t0 and len(t0) > 800:
+        t0 = re.sub(r"(?<=\.)\s+(?=[A-Z])", "\n\n", t0)
+    return t0.strip()
 
 def badge(label: str) -> str:
     label = label or "Unsure"
@@ -514,7 +456,6 @@ def init_state():
 
     # ROB2
     ss.setdefault("rob2", {})
-    ss.setdefault("rob2_ai_suggestion", {})
 
     # Manuscript
     ss.setdefault("ms_sections", {})
@@ -1047,79 +988,8 @@ def heuristic_ta(proto: Protocol, row: pd.Series) -> Tuple[str, str, float]:
 # Full-text utilities
 # =========================================================
 def extract_pdf_text(pdf_bytes: bytes, max_pages: int = 30) -> str:
-    """Extract text from a PDF using whatever backend is available.
-
-    Tries (in order):
-    1) PdfReader (PyPDF2 / pypdf)
-    2) pdfplumber (if installed)
-    3) PyMuPDF / fitz (if installed)
-
-    Returns empty string on failure.
-    """
-    if not pdf_bytes:
+    if not (HAS_PYPDF2 and pdf_bytes):
         return ""
-
-    # 1) PdfReader path
-    if PdfReader is not None:
-        try:
-            reader = PdfReader(io.BytesIO(pdf_bytes))
-            parts: List[str] = []
-            pages = getattr(reader, "pages", [])
-            for i, page in enumerate(pages):
-                if i >= max_pages:
-                    break
-                try:
-                    txt = page.extract_text() if hasattr(page, "extract_text") else ""
-                    if txt:
-                        parts.append(txt)
-                except Exception:
-                    continue
-            out = "\n".join(parts).strip()
-            if out:
-                return out
-        except Exception:
-            pass
-
-    # 2) pdfplumber path
-    if HAS_PDFPLUMBER and pdfplumber is not None:
-        try:
-            parts: List[str] = []
-            with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-                for i, page in enumerate(pdf.pages):
-                    if i >= max_pages:
-                        break
-                    try:
-                        txt = page.extract_text() or ""
-                        if txt:
-                            parts.append(txt)
-                    except Exception:
-                        continue
-            out = "\n".join(parts).strip()
-            if out:
-                return out
-        except Exception:
-            pass
-
-    # 3) fitz path
-    if HAS_FITZ and fitz is not None:
-        try:
-            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-            parts: List[str] = []
-            for i in range(min(len(doc), max_pages)):
-                try:
-                    txt = doc.load_page(i).get_text("text") or ""
-                    if txt:
-                        parts.append(txt)
-                except Exception:
-                    continue
-            out = "\n".join(parts).strip()
-            if out:
-                return out
-        except Exception:
-            pass
-
-    return ""
-
     try:
         reader = PdfReader(io.BytesIO(pdf_bytes))
         parts = []
@@ -1595,120 +1465,438 @@ def run_pipeline():
                 ta_ai[pmid] = lbl
                 ta_reason[pmid] = rs
                 ta_conf[pmid] = cf
-        
         else:
-            # Partition by decision after AI + optional overrides, for readability
-            def _ai_label(p: str) -> str:
-                return st.session_state.get("ta_ai", {}).get(str(p), "Unsure") or "Unsure"
+            for _, r in df.iterrows():
+                pmid = str(r.get("PMID",""))
+                lbl, rs, cf = heuristic_ta(proto, r)
+                ta_ai[pmid] = lbl
+                ta_reason[pmid] = rs
+                ta_conf[pmid] = cf
 
-            def _final_label(p: str) -> str:
-                p = str(p)
-                return (st.session_state.get("ta_override", {}).get(p, "") or _ai_label(p) or "Unsure")
+    st.session_state["ta_ai"] = ta_ai
+    st.session_state["ta_ai_reason"] = ta_reason
+    st.session_state["ta_ai_conf"] = ta_conf
 
-            df2 = df.copy()
-            df2["AI_suggest"] = [_ai_label(p) for p in df2["PMID"].astype(str)]
-            df2["Final"] = [_final_label(p) for p in df2["PMID"].astype(str)]
+    # Init full-text decisions for kept records
+    for pmid, lbl in ta_ai.items():
+        if pmid not in st.session_state["ft_decision"]:
+            st.session_state["ft_decision"][pmid] = "Not reviewed"
+            st.session_state["ft_reason"][pmid] = ""
 
-            # Group order: Include -> Unsure -> Exclude
-            groups = [
-                ("Include", df2[df2["Final"] == "Include"].copy(), True),
-                ("Unsure", df2[df2["Final"] == "Unsure"].copy(), True),
-                ("Exclude", df2[df2["Final"] == "Exclude"].copy(), False),
+
+def _current_pmids() -> set:
+    df = st.session_state.get("pubmed_records")
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty or "PMID" not in df.columns:
+        return set()
+    return set(str(x) for x in df["PMID"].astype(str).tolist() if str(x).strip())
+
+
+def _prune_dict(d: Dict[str, Any], keep: set) -> Dict[str, Any]:
+    if not isinstance(d, dict):
+        return {}
+    return {k: v for k, v in d.items() if str(k) in keep}
+
+
+def _prune_after_refetch():
+    """Keep user work for records still present; drop the rest to avoid mismatch."""
+    keep = _current_pmids()
+    st.session_state["ta_ai"] = _prune_dict(st.session_state.get("ta_ai", {}), keep)
+    st.session_state["ta_ai_reason"] = _prune_dict(st.session_state.get("ta_ai_reason", {}), keep)
+    st.session_state["ta_ai_conf"] = _prune_dict(st.session_state.get("ta_ai_conf", {}), keep)
+    st.session_state["ta_override"] = _prune_dict(st.session_state.get("ta_override", {}), keep)
+    st.session_state["ta_override_reason"] = _prune_dict(st.session_state.get("ta_override_reason", {}), keep)
+
+    st.session_state["ft_decision"] = _prune_dict(st.session_state.get("ft_decision", {}), keep)
+    st.session_state["ft_reason"] = _prune_dict(st.session_state.get("ft_reason", {}), keep)
+    st.session_state["ft_pdf"] = _prune_dict(st.session_state.get("ft_pdf", {}), keep)
+    st.session_state["ft_text"] = _prune_dict(st.session_state.get("ft_text", {}), keep)
+
+    ex = st.session_state.get("extract_df")
+    if isinstance(ex, pd.DataFrame) and not ex.empty and "PMID" in ex.columns:
+        st.session_state["extract_df"] = ex[ex["PMID"].astype(str).isin(keep)].reset_index(drop=True)
+
+    rb = st.session_state.get("rob2_df")
+    if isinstance(rb, pd.DataFrame) and not rb.empty and "PMID" in rb.columns:
+        st.session_state["rob2_df"] = rb[rb["PMID"].astype(str).isin(keep)].reset_index(drop=True)
+
+
+def _llm_enabled() -> bool:
+    return bool(
+        st.session_state.get("byok_enabled")
+        and st.session_state.get("byok_consent")
+        and (st.session_state.get("byok_base_url") or "").strip()
+        and (st.session_state.get("byok_model") or "").strip()
+        and (st.session_state.get("byok_key") or "").strip()
+    )
+
+
+def compute_ta_suggestions(proto: Protocol, df: pd.DataFrame):
+    """Compute AI (or heuristic) title/abstract screening suggestions for FULL-TEXT."""
+    ta_ai: Dict[str, str] = {}
+    ta_reason: Dict[str, str] = {}
+    ta_conf: Dict[str, float] = {}
+
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        st.session_state["ta_ai"] = {}
+        st.session_state["ta_ai_reason"] = {}
+        st.session_state["ta_ai_conf"] = {}
+        return
+
+    # Build payload for LLM
+    payload = []
+    for _, r in df.iterrows():
+        payload.append({
+            "PMID": str(r.get("PMID","")),
+            "Title": str(r.get("Title","") or ""),
+            "Abstract": str(r.get("Abstract","") or "")[:3500],
+            "Year": str(r.get("Year","") or ""),
+            "FirstAuthor": str(r.get("FirstAuthor","") or ""),
+            "Journal": str(r.get("Journal","") or ""),
+        })
+
+    if _llm_enabled():
+        try:
+            sys = (
+                "You are screening PubMed records for a systematic review/meta-analysis. "
+                "Given PICO and a list of records, label each record as Include/Exclude/Unsure for FULL-TEXT review, "
+                "and provide a concise rationale and a confidence 0-1. "
+                "Do not fabricate. Return STRICT JSON: {pmid: {label, reason, confidence}}."
+            )
+            user = json.dumps({"PICO": proto.to_dict().get("pico"), "records": payload}, ensure_ascii=False)
+            d = llm_json(sys, user, max_tokens=1700) or {}
+            for rec in payload:
+                pmid = str(rec.get("PMID",""))
+                item = d.get(pmid) or d.get(str(pmid)) or {}
+                lbl = str(item.get("label") or "Unsure").strip()
+                if lbl not in ["Include","Exclude","Unsure"]:
+                    lbl = "Unsure"
+                ta_ai[pmid] = lbl
+                ta_reason[pmid] = str(item.get("reason") or "").strip()
+                try:
+                    cf = float(item.get("confidence", 0.5))
+                except Exception:
+                    cf = 0.5
+                ta_conf[pmid] = max(0.0, min(1.0, cf))
+        except Exception as e:
+            # Fall back to heuristic
+            for _, r in df.iterrows():
+                pmid = str(r.get("PMID",""))
+                lbl, rs, cf = heuristic_ta(proto, r)
+                ta_ai[pmid] = lbl
+                ta_reason[pmid] = rs
+                ta_conf[pmid] = cf
+    else:
+        for _, r in df.iterrows():
+            pmid = str(r.get("PMID",""))
+            lbl, rs, cf = heuristic_ta(proto, r)
+            ta_ai[pmid] = lbl
+            ta_reason[pmid] = rs
+            ta_conf[pmid] = cf
+
+    st.session_state["ta_ai"] = ta_ai
+    st.session_state["ta_ai_reason"] = ta_reason
+    st.session_state["ta_ai_conf"] = ta_conf
+
+
+def refetch_pubmed_and_sync():
+    """Re-fetch PubMed using the (possibly manually edited) query and re-sync downstream steps."""
+    q = (st.session_state.get("pubmed_query") or "").strip()
+    if not q:
+        return
+    max_n = int(st.session_state.get("max_pubmed_records", 1000) or 1000)
+    page_size = int(st.session_state.get("pubmed_page_size", 200) or 200)
+
+    df, diag = fetch_pubmed(q, max_records=max_n, page_size=page_size)
+    st.session_state["pubmed_records"] = df
+    st.session_state["diagnostics"] = diag
+
+    # Feasibility query should follow CURRENT query (not the old auto_q)
+    feas_q = f"({q}) AND (systematic review[pt] OR meta-analysis[pt] OR \"systematic review\"[tiab] OR \"meta analysis\"[tiab] OR \"network meta-analysis\"[tiab] OR NMA[tiab])"
+    st.session_state["feas_query"] = feas_q
+    hits, _ = fetch_pubmed(feas_q, max_records=60, page_size=page_size)
+    st.session_state["srma_hits"] = hits
+
+    proto = st.session_state.get("protocol")
+    if proto and isinstance(proto, Protocol):
+        compute_ta_suggestions(proto, df)
+
+    # Keep only work that still matches current PMIDs
+    _prune_after_refetch()
+
+if run_clicked:
+    run_pipeline()
+
+# =========================================================
+# Tab 0: Overview / PRISMA
+# =========================================================
+with tabs[0]:
+    st.subheader(t("tabs_overview"))
+    prisma = compute_prisma(st.session_state.get("pubmed_records"))
+    prisma_flow(prisma)
+
+# =========================================================
+# Tab 1: Step 1 - Query editable + PICO edits
+# =========================================================
+with tabs[1]:
+    st.subheader(t("tabs_step1"))
+
+    proto: Protocol = st.session_state.get("protocol")
+    if not proto:
+        st.info("請先輸入問題並按 Run。")
+    else:
+        with st.expander(t("pico_edit"), expanded=True):
+            # Manual PICO correction (core ask)
+            c1, c2 = st.columns(2)
+            with c1:
+                P = st.text_input("P", value=proto.P, key="edit_P")
+                I_ = st.text_input("I", value=proto.I, key="edit_I")
+                C = st.text_input("C", value=proto.C, key="edit_C")
+                O = st.text_input("O", value=proto.O, key="edit_O")
+                NOT = st.text_input("NOT", value=proto.NOT, key="edit_NOT")
+            with c2:
+                st.caption("Synonyms (comma-separated; English preferred)")
+                P_syn = st.text_area("P synonyms", value=", ".join(proto.P_syn or []), key="edit_P_syn", height=70)
+                I_syn = st.text_area("I synonyms", value=", ".join(proto.I_syn or []), key="edit_I_syn", height=70)
+                C_syn = st.text_area("C synonyms", value=", ".join(proto.C_syn or []), key="edit_C_syn", height=70)
+                O_syn = st.text_area("O synonyms", value=", ".join(proto.O_syn or []), key="edit_O_syn", height=70)
+                st.caption("MeSH candidates (comma-separated)")
+                mesh_P = st.text_area("MeSH P", value=", ".join(proto.mesh_P or []), key="edit_mesh_P", height=60)
+                mesh_I = st.text_area("MeSH I", value=", ".join(proto.mesh_I or []), key="edit_mesh_I", height=60)
+                mesh_C = st.text_area("MeSH C", value=", ".join(proto.mesh_C or []), key="edit_mesh_C", height=60)
+                mesh_O = st.text_area("MeSH O", value=", ".join(proto.mesh_O or []), key="edit_mesh_O", height=60)
+
+            if st.button(t("pico_apply"), type="primary"):
+                proto.P = norm_text(P); proto.I = norm_text(I_); proto.C = norm_text(C); proto.O = norm_text(O)
+                proto.NOT = norm_text(NOT)
+                proto.P_syn = [norm_text(x) for x in re.split(r"[,\n]+", P_syn or "") if norm_text(x)]
+                proto.I_syn = [norm_text(x) for x in re.split(r"[,\n]+", I_syn or "") if norm_text(x)]
+                proto.C_syn = [norm_text(x) for x in re.split(r"[,\n]+", C_syn or "") if norm_text(x)]
+                proto.O_syn = [norm_text(x) for x in re.split(r"[,\n]+", O_syn or "") if norm_text(x)]
+                proto.mesh_P = [norm_text(x) for x in re.split(r"[,\n]+", mesh_P or "") if norm_text(x)]
+                proto.mesh_I = [norm_text(x) for x in re.split(r"[,\n]+", mesh_I or "") if norm_text(x)]
+                proto.mesh_C = [norm_text(x) for x in re.split(r"[,\n]+", mesh_C or "") if norm_text(x)]
+                proto.mesh_O = [norm_text(x) for x in re.split(r"[,\n]+", mesh_O or "") if norm_text(x)]
+                st.session_state["protocol"] = proto
+
+                # rebuild query auto + sync current query to auto (but keep user's manual edits if present)
+                auto_q = build_pubmed_query(proto, st.session_state.get("article_type","不限"), st.session_state.get("custom_pubmed_filter",""))
+                st.session_state["pubmed_query_auto"] = auto_q
+                if st.session_state.get("pubmed_query","") == "" or st.session_state.get("pubmed_query","") == st.session_state.get("pubmed_query_auto",""):
+                    st.session_state["pubmed_query"] = auto_q
+                st.success("已套用 PICO 修正；請到下方檢查/手改 PubMed query。")
+
+        st.markdown("**Protocol (current)**")
+        st.code(pretty_json(proto.to_dict()), language="json")
+
+        st.markdown("### " + t("pubmed_edit"))
+        st.text_area("", key="pubmed_query", height=120)
+        cA, cB, cC = st.columns([1,1,2])
+        with cA:
+            if st.button(t("pubmed_refetch"), type="primary"):
+                refetch_pubmed_and_sync()
+                df = st.session_state.get("pubmed_records", pd.DataFrame())
+                diag = st.session_state.get("diagnostics", {})
+                st.success(f"抓到 {df.shape[0]} 篇（PubMed count={diag.get('pubmed_total_count',0)}）。")
+                st.info("已使用手動 PubMed query 重新抓取並同步後續步驟；若先前已有人工標記/抽取，系統僅保留仍存在於目前 records 的部分。")
+        with cB:
+            if st.button(t("pubmed_restore")):
+                st.session_state["pubmed_query"] = st.session_state.get("pubmed_query_auto","")
+        with cC:
+            st.download_button(
+                t("download_query"),
+                data=st.session_state.get("pubmed_query","").encode("utf-8"),
+                file_name="pubmed_query.txt",
+                mime="text/plain",
+            )
+
+# =========================================================
+# Tab 2: Feasibility scan + recommendations
+# =========================================================
+with tabs[2]:
+    st.subheader(t("feas_title"))
+    hits = st.session_state.get("srma_hits")
+    if hits is None or not isinstance(hits, pd.DataFrame) or hits.empty:
+        st.info("尚未執行可行性掃描。請先 Run。")
+    else:
+        st.caption("此區塊用來快速判斷：是否已有大量 SR/MA/NMA；是否需要裁切題目（族群/介入/比較/結果/研究設計）。")
+        st.markdown("**Feasibility query (auto)**")
+        st.code(st.session_state.get("feas_query",""), language="text")
+        st.markdown("**Existing SR/MA/NMA hits (sample)**")
+        show_cols = ["PMID","Year","First_author","Journal","Title"]
+        hits2 = ensure_columns(hits.copy(), show_cols, default="")
+        st.dataframe(hits2[show_cols].head(20), use_container_width=True)
+
+        # Heuristic recommendations
+        n_hits = hits.shape[0]
+        recs = []
+        if n_hits >= 15:
+            recs.append("已有相當多 SR/MA/NMA：建議縮小題目（特定族群/特定 IOL 型號/特定 outcome/特定追蹤時間/只納入 RCT）。")
+            recs.append("若仍要做：可考慮『更新版』（加上近 2-3 年新 RCT）、或做 subgroup/診斷/手術方式差異。")
+        elif 5 <= n_hits < 15:
+            recs.append("已有一些 SR/MA：建議先讀最相關 2-3 篇，確認缺口（outcome 未涵蓋、亞組未做、研究設計/新器材）。")
+        else:
+            recs.append("目前 SR/MA/NMA 命中不多：可能具有可行性。仍建議檢查是否需要加入 MeSH/型號關鍵字提高召回。")
+
+        if st.session_state.get("goal_mode") == "Fast / feasible (gap-fill)":
+            recs.append("目標取向為『快速可行』：可優先選擇最容易得到 RCT、outcome 定義一致的題目。")
+        else:
+            recs.append("目標取向為『嚴謹範圍』：建議預先定義 outcome/timepoint 並限制納入條件，避免不可比。")
+
+        st.markdown("**綜合建議**")
+        for r in recs:
+            st.write("- " + r)
+
+        if llm_available():
+            with st.expander(t("feas_optional"), expanded=False):
+                if st.button("Generate feasibility report (BYOK)"):
+                    proto: Protocol = st.session_state.get("protocol")
+                    sys = (
+                        "You are helping plan a feasible SR/MA/NMA. "
+                        "Given the research question, PICO, and a sample of existing SR/MA/NMA hits, "
+                        "produce a feasibility report with (1) summary, (2) whether to proceed, "
+                        "(3) recommended PICO refinements (narrow/shift), and (4) suggested outcomes/timepoints. "
+                        "Return STRICT JSON with keys: proceed (yes/no), summary, recommended_changes (list), suggested_outcomes (list)."
+                    )
+                    sample = hits2[show_cols].head(12).to_dict(orient="records")
+                    user = json.dumps({"question_en": st.session_state.get("question_en",""),
+                                      "PICO": proto.to_dict().get("pico"),
+                                      "existing_srma_sample": sample}, ensure_ascii=False)
+                    d = llm_json(sys, user, max_tokens=1200) or {}
+                    st.json(d)
+
+# =========================================================
+# Tab 3: Step 3+4 - Records + screening (merged)
+# =========================================================
+with tabs[3]:
+    st.subheader(t("tabs_step34"))
+    df = st.session_state.get("pubmed_records")
+
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        st.info(t("records_none"))
+    else:
+        # Ensure stable columns (avoid KeyError when upstream schema changes)
+        df = ensure_columns(
+            df.copy(),
+            ["PMID", "Title", "Abstract", "Year", "First_author", "Journal", "DOI", "PMCID", "PublicationTypes"],
+            default="",
+        )
+        st.caption("每篇文獻含：PMID/DOI/Year/First author/Journal、PubMed/DOI/PMC/學院全文(OpenURL/EZproxy)、AI 建議與信心度、以及人工 override（可稽核）。")
+
+        # Bulk tools
+        c1, c2, c3, c4 = st.columns([1, 1, 1.1, 2.2])
+        with c1:
+            if st.button("Override all Unsure → Include"):
+                for pmid in df["PMID"].astype(str).tolist():
+                    if st.session_state.get("ta_ai", {}).get(pmid, "Unsure") == "Unsure":
+                        st.session_state["ta_override"][pmid] = "Include"
+                        st.session_state["ta_override_reason"][pmid] = "Batch override: keep for full text."
+        with c2:
+            if st.button("Clear all overrides"):
+                st.session_state["ta_override"] = {}
+                st.session_state["ta_override_reason"] = {}
+        with c3:
+            view_mode = st.radio("顯示方式", options=["卡片", "表格（精簡）"], horizontal=True, index=0, key="view_mode_step34")
+        with c4:
+            st.write("")
+
+        show_cards = (st.session_state.get("view_mode_step34", "卡片") == "卡片")
+
+        if not show_cards:
+            view = df[["PMID", "Year", "First_author", "Journal", "Title"]].copy()
+            view["AI_suggest"] = [st.session_state.get("ta_ai", {}).get(str(p), "") for p in view["PMID"].astype(str)]
+            view["Final"] = [
+                (st.session_state.get("ta_override", {}).get(str(p), "") or st.session_state.get("ta_ai", {}).get(str(p), ""))
+                for p in view["PMID"].astype(str)
             ]
+            st.dataframe(view, use_container_width=True, hide_index=True)
+        else:
+            for _, r in df.iterrows():
+                pmid = str(r.get("PMID", "") or "").strip()
+                title = str(r.get("Title", "") or "").strip()
+                abstract = str(r.get("Abstract", "") or "")
+                year = str(r.get("Year", "") or "").strip()
+                fa = str(r.get("First_author", "") or "").strip()
+                journal = str(r.get("Journal", "") or "").strip()
+                doi = str(r.get("DOI", "") or "").strip()
+                pmcid = str(r.get("PMCID", "") or "").strip()
+                pubtypes = str(r.get("PublicationTypes", "") or "").strip()
 
-            for glabel, gdf, gexp in groups:
-                with st.expander(f"{glabel}（{gdf.shape[0]} 篇）", expanded=gexp):
-                    if gdf.empty:
-                        st.caption("—")
-                        continue
+                ai_lbl = st.session_state.get("ta_ai", {}).get(pmid, "Unsure")
+                ai_reason = st.session_state.get("ta_ai_reason", {}).get(pmid, "")
+                ai_conf = float(st.session_state.get("ta_ai_conf", {}).get(pmid, 0.5) or 0.5)
 
-                    for _, r in gdf.iterrows():
-                        pmid = str(r.get("PMID", "") or "").strip()
-                        title = str(r.get("Title", "") or "").strip()
-                        abstract = str(r.get("Abstract", "") or "")
-                        year = str(r.get("Year", "") or "").strip()
-                        fa = str(r.get("First_author", "") or "").strip()
-                        journal = str(r.get("Journal", "") or "").strip()
-                        doi = str(r.get("DOI", "") or "").strip()
-                        pmcid = str(r.get("PMCID", "") or "").strip()
-                        pubtypes = str(r.get("PublicationTypes", "") or "").strip()
+                ov = st.session_state.get("ta_override", {}).get(pmid, "")
+                ov_reason = st.session_state.get("ta_override_reason", {}).get(pmid, "")
+                final_lbl = ov if ov else ai_lbl
 
-                        ai_lbl = _ai_label(pmid)
-                        ai_reason = st.session_state.get("ta_ai_reason", {}).get(pmid, "")
-                        ai_conf = float(st.session_state.get("ta_ai_conf", {}).get(pmid, 0.5) or 0.5)
+                head = f"PMID:{pmid or '—'}｜{short(title or '—', 110)}"
+                with st.expander(head, expanded=False):
+                    st.markdown("<div class='card'>", unsafe_allow_html=True)
 
-                        ov = st.session_state.get("ta_override", {}).get(pmid, "")
-                        ov_reason = st.session_state.get("ta_override_reason", {}).get(pmid, "")
-                        final_lbl = _final_label(pmid)
+                    meta = f"PMID: {pmid or '—'}　|　DOI: {doi or '—'}　|　Year: {year or '—'}　|　First author: {fa or '—'}　|　Journal: {journal or '—'}"
+                    st.markdown(f"**{title or '—'}**")
+                    st.markdown(f"<div class='small'>{meta}</div>", unsafe_allow_html=True)
 
-                        head = f"PMID:{pmid or '—'}｜{short(title or '—', 110)}"
-                        with st.expander(head, expanded=False):
-                            st.markdown("<div class='card'>", unsafe_allow_html=True)
+                    links = []
+                    if pubmed_link(pmid):
+                        links.append(f"[PubMed]({maybe_ezproxy(pubmed_link(pmid))})")
+                    if doi:
+                        links.append(f"[DOI]({maybe_ezproxy(doi_link(doi))})")
+                    if pmcid:
+                        links.append(f"[PMC]({maybe_ezproxy(pmc_link(pmcid))})")
+                    if resolver_url(doi, pmid):
+                        links.append(f"[學院全文(OpenURL)]({resolver_url(doi, pmid)})")
+                    if links:
+                        st.markdown(" | ".join(links))
 
-                            meta = f"PMID: {pmid or '—'}　|　DOI: {doi or '—'}　|　Year: {year or '—'}　|　First author: {fa or '—'}　|　Journal: {journal or '—'}"
-                            st.markdown(f"**{title or '—'}**")
-                            st.markdown(f"<div class='small'>{meta}</div>", unsafe_allow_html=True)
+                    st.markdown(
+                        f"{badge(final_lbl)} <span class='small'>Effective decision</span>"
+                        f"&nbsp;&nbsp;{badge(ai_lbl)} <span class='small'>AI Title/Abstract 建議</span>"
+                        f"&nbsp;&nbsp;<span class='small'>信心度：{ai_conf:.2f}</span>",
+                        unsafe_allow_html=True,
+                    )
+                    if ai_reason:
+                        st.write("理由：" + ai_reason)
 
-                            links = []
-                            if pubmed_link(pmid):
-                                links.append(f"[PubMed]({maybe_ezproxy(pubmed_link(pmid))})")
-                            if doi:
-                                links.append(f"[DOI]({maybe_ezproxy(doi_link(doi))})")
-                            if pmcid:
-                                links.append(f"[PMC]({maybe_ezproxy(pmc_link(pmcid))})")
-                            if resolver_url(doi, pmid):
-                                links.append(f"[學院全文(OpenURL)]({resolver_url(doi, pmid)})")
-                            if links:
-                                st.markdown(" | ".join(links))
+                    if pubtypes:
+                        st.caption("Publication types: " + pubtypes)
 
-                            st.markdown(
-                                f"{badge(final_lbl)} <span class='small'>Effective decision</span>"
-                                f"&nbsp;&nbsp;{badge(ai_lbl)} <span class='small'>AI Title/Abstract 建議</span>"
-                                f"&nbsp;&nbsp;<span class='small'>信心度：{ai_conf:.2f}</span>",
-                                unsafe_allow_html=True,
-                            )
-                            if ai_reason:
-                                st.write("理由：" + ai_reason)
+                    st.markdown("<hr class='hr'/>", unsafe_allow_html=True)
 
-                            if pubtypes:
-                                st.caption("Publication types: " + pubtypes)
+                    # Abstract (paragraph separated)
+                    st.markdown("#### Abstract")
+                    abs_fmt = format_abstract(abstract)
+                    if abs_fmt:
+                        for para in abs_fmt.split("\n\n"):
+                            if para.strip():
+                                st.write(para.strip())
+                    else:
+                        st.caption("_No abstract available._")
 
-                            st.markdown("<hr class='hr'/>", unsafe_allow_html=True)
+                    st.markdown("<hr class='hr'/>", unsafe_allow_html=True)
 
-                            # Abstract (paragraph separated)
-                            st.markdown("#### Abstract")
-                            abs_fmt = format_abstract(abstract)
-                            if abs_fmt:
-                                for para in abs_fmt.split("\n\n"):
-                                    if para.strip():
-                                        st.write(para.strip())
-                            else:
-                                st.caption("_No abstract available._")
+                    # Override
+                    st.markdown("#### 人工修正（override）")
+                    choice = st.radio(
+                        f"Final decision (Title/Abstract) — PMID：{pmid or '—'}",
+                        options=["(use AI)", "Include", "Exclude", "Unsure"],
+                        index=0 if not ov else ["(use AI)", "Include", "Exclude", "Unsure"].index(ov),
+                        key=f"ta_override_radio_{pmid}",
+                        horizontal=True,
+                    )
+                    if choice == "(use AI)":
+                        st.session_state["ta_override"].pop(pmid, None)
+                    else:
+                        st.session_state["ta_override"][pmid] = choice
 
-                            st.markdown("<hr class='hr'/>", unsafe_allow_html=True)
+                    st.session_state["ta_override_reason"][pmid] = st.text_area(
+                        "Override reason（可留空；建議寫清楚入/排原因，方便 full text review 與 PRISMA）",
+                        value=ov_reason,
+                        key=f"ta_override_reason_{pmid}",
+                        height=85,
+                    )
 
-                            # Override
-                            st.markdown("#### 人工修正（override）")
-                            choice = st.radio(
-                                f"Final decision (Title/Abstract) — PMID：{pmid or '—'}",
-                                options=["(use AI)", "Include", "Exclude", "Unsure"],
-                                index=0 if not ov else ["(use AI)", "Include", "Exclude", "Unsure"].index(ov),
-                                key=f"ta_override_radio_{pmid}",
-                                horizontal=True,
-                            )
-                            if choice == "(use AI)":
-                                st.session_state["ta_override"].pop(pmid, None)
-                            else:
-                                st.session_state["ta_override"][pmid] = choice
-
-                            st.session_state["ta_override_reason"][pmid] = st.text_area(
-                                "Override reason（可留空；建議寫清楚入/排原因，方便 full text review 與 PRISMA）",
-                                value=ov_reason,
-                                key=f"ta_override_reason_{pmid}",
-                                height=85,
-                            )
-
-                            st.markdown("</div>", unsafe_allow_html=True)
+                    st.markdown("</div>", unsafe_allow_html=True)
 
 # =========================================================
 # Tab 4: Step 4b Full text review (decisions + reasons + PDF upload)
@@ -1805,7 +1993,7 @@ with tabs[4]:
                         if up is not None:
                             st.session_state["ft_pdf"][pmid] = up.read()
                         pdf_present = pmid in st.session_state.get("ft_pdf", {})
-                        st.caption(f"PDF: {'已上傳' if pdf_present else '未上傳'} | Reader: {'Yes' if PdfReader is not None else 'No'} | pdfplumber: {'Yes' if HAS_PDFPLUMBER else 'No'} | fitz: {'Yes' if HAS_FITZ else 'No'}")
+                        st.caption(f"PDF: {'已上傳' if pdf_present else '未上傳'} | PyPDF2: {'Yes' if HAS_PYPDF2 else 'No'}")
 
                     # Extract / paste full text
                     if pmid in st.session_state.get("ft_pdf", {}) and st.button(t("ft_extract_text"), key=f"ft_extract_btn_{pmid}"):
@@ -2132,38 +2320,7 @@ with tabs[7]:
                             )
                             user = json.dumps({"full_text": ft_text[:16000]}, ensure_ascii=False)
                             d = llm_json(sys, user, max_tokens=1200) or {}
-                            st.session_state["rob2_ai_suggestion"][pmid] = d
                             st.json(d)
-
-                        sug = (st.session_state.get("rob2_ai_suggestion") or {}).get(pmid, {})
-                        if isinstance(sug, dict) and sug:
-                            c_apply, c_note = st.columns([1, 3])
-                            with c_apply:
-                                if st.button("Apply suggestion to form", key=f"rob2_apply_{pmid}"):
-                                    # Write into widget keys so dropdowns reflect the suggestion
-                                    for i, dom in enumerate(ROB_DOMAINS):
-                                        v = str(sug.get(dom, "") or "").strip()
-                                        if v in ROB_LEVELS:
-                                            st.session_state[f"rob_{pmid}_{i}"] = v
-                                    v_overall = str(sug.get("Overall", "") or "").strip()
-                                    if v_overall in ROB_LEVELS:
-                                        st.session_state[f"rob_{pmid}_overall"] = v_overall
-                                    why = str(sug.get("Rationale", "") or "").strip()
-                                    if why:
-                                        st.session_state[f"rob_{pmid}_why"] = why
-                                    # Mirror into rob2 store
-                                    rob2 = st.session_state.get("rob2", {}).get(pmid, {})
-                                    for dom in ROB_DOMAINS:
-                                        if str(sug.get(dom, "") or "") in ROB_LEVELS:
-                                            rob2[dom] = str(sug.get(dom))
-                                    if v_overall in ROB_LEVELS:
-                                        rob2["Overall"] = v_overall
-                                    if why:
-                                        rob2["Rationale"] = why
-                                    st.session_state["rob2"][pmid] = rob2
-                                    st.success("已套用 AI 建議（請務必人工核對理由與 domain）。")
-                            with c_note:
-                                st.caption("提示：AI 只能做『建議』，ROB2 仍需根據全文方法學細節人工確認與補上理由。若抽不到全文文字（掃描 PDF），請先 OCR 或改貼文字。")
 
 # =========================================================
 # Tab 8: Manuscript (sections shown + optional BYOK) + export
