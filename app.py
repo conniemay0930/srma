@@ -395,6 +395,7 @@ class Protocol:
 def init_state():
     ss = st.session_state
     ss.setdefault("UI_LANG", "zh-TW")
+    ss.setdefault("UI_LANG_DISPLAY", "繁體中文")
 
     # BYOK
     ss.setdefault("byok_enabled", False)
@@ -506,13 +507,13 @@ def llm_json(system: str, user: str, max_tokens: int = 1200) -> Optional[dict]:
 # =========================================================
 with st.sidebar:
     st.header(t("settings"))
-    st.selectbox(
+    lang_choice = st.selectbox(
         t("lang_label"),
-        options=["zh-TW", "en"],
+        options=["繁體中文", "English"],
         index=(0 if st.session_state.get("UI_LANG","zh-TW") == "zh-TW" else 1),
-        key="UI_LANG",
-        format_func=lambda x: ("繁體中文" if x == "zh-TW" else "English"),
+        key="UI_LANG_DISPLAY",
     )
+    st.session_state["UI_LANG"] = ("zh-TW" if lang_choice == "繁體中文" else "en")
 
     with st.expander(t("tips_title"), expanded=False):
         st.markdown(
