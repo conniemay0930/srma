@@ -1765,7 +1765,7 @@ with tabs[2]:
                     st.json(d)
 
 # =========================================================
-# Tab 3: Step 3+4 - Records + screening (merged)
+# Tab 3: Step 3+4 - Records + screening 
 # =========================================================
 with tabs[3]:
     st.subheader(t("tabs_step34"))
