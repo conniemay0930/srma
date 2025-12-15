@@ -414,6 +414,10 @@ def init_state():
     ss.setdefault("custom_pubmed_filter", "")
     ss.setdefault("goal_mode", "Fast / feasible (gap-fill)")
 
+    # PubMed fetch limits
+    ss.setdefault("max_pubmed_records", 1000)
+    ss.setdefault("pubmed_page_size", 200)
+
     # artifacts
     ss.setdefault("protocol", Protocol(P_syn=[], I_syn=[], C_syn=[], O_syn=[], mesh_P=[], mesh_I=[], mesh_C=[], mesh_O=[]))
     ss.setdefault("question_en", "")  # best-effort English
@@ -541,6 +545,10 @@ with st.sidebar:
     st.subheader(t("search_settings"))
     st.selectbox(t("article_type"), options=["不限","RCT","SR/MA","NMA","Cohort","Case-control"], key="article_type")
     st.text_input(t("custom_filter"), key="custom_pubmed_filter", help="例如：humans[MeSH Terms] AND english[lang]；會 AND 到搜尋式內。")
+    # PubMed fetch cap (default 1000); increase if you expect more records.
+    _max_label = "最大抓取篇數（PubMed）" if st.session_state.get("UI_LANG","zh-TW") == "zh-TW" else "Max PubMed records to fetch"
+    st.select_slider(_max_label, options=[200, 500, 1000, 2000, 5000], key="max_pubmed_records")
+    st.caption("提示：抓取越多篇，越慢；PubMed/eUtils 有流量限制。若你預期 >5000，建議改用本機版或分批檢索。" if st.session_state.get("UI_LANG","zh-TW") == "zh-TW" else "Tip: higher limits run slower and may hit eUtils throttling. For >5000, use local/batched search.")
     st.selectbox(t("goal_mode"), options=["Fast / feasible (gap-fill)", "Rigorous / narrow scope"], key="goal_mode")
 
 # =========================================================
@@ -858,18 +866,89 @@ def efetch(pmids: List[str]) -> Tuple[pd.DataFrame, List[str], List[str]]:
     df = pd.DataFrame(rows)
     return df, [efetch_url], warnings
 
-def fetch_pubmed(term: str, max_records: int = 200) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    diag: Dict[str, Any] = {"warnings": [], "esearch_url": "", "efetch_urls": []}
-    ids, count, es_url, warn = esearch(term, 0, max_records)
-    diag["pubmed_total_count"] = count
-    diag["esearch_url"] = es_url
-    diag["warnings"].extend(warn)
-    if not ids:
+def fetch_pubmed(term: str, max_records: int = 200, page_size: int = 200) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """
+    Fetch PubMed records using ESearch pagination + EFetch batching.
+
+    max_records: maximum number of records to retrieve (client-side cap)
+    page_size: ESearch page size (<= 200 is usually safe)
+    """
+    diag: Dict[str, Any] = {"warnings": [], "esearch_urls": [], "efetch_urls": [], "pubmed_total_count": 0}
+    term = (term or "").strip()
+    if not term:
+        diag["warnings"].append("Empty PubMed query.")
         return pd.DataFrame(), diag
-    df, ef_urls, warn2 = efetch(ids)
-    diag["efetch_urls"] = ef_urls
-    diag["warnings"].extend(warn2)
-    return df, diag
+
+    # First page to get count + first ids
+    all_ids: List[str] = []
+    retstart = 0
+    remaining = int(max_records or 0)
+    page_size = int(page_size or 200)
+    if page_size <= 0:
+        page_size = 200
+    if page_size > 200:
+        page_size = 200  # PubMed often caps practical retmax; keep safe
+
+    # Iterate ESearch
+    total_count = 0
+    while True:
+        this_retmax = min(page_size, max(0, remaining))
+        if this_retmax <= 0:
+            break
+        ids, count, es_url, warn = esearch(term, retstart, this_retmax)
+        diag["esearch_urls"].append(es_url)
+        diag["warnings"].extend(warn)
+        if retstart == 0:
+            total_count = int(count or 0)
+            diag["pubmed_total_count"] = total_count
+        if not ids:
+            break
+        all_ids.extend([str(x) for x in ids])
+        retstart += len(ids)
+        remaining -= len(ids)
+
+        # Stop if we reached the end per PubMed count or no progress
+        if total_count and retstart >= total_count:
+            break
+        if len(ids) < this_retmax:
+            break
+
+        # light throttle
+        time.sleep(0.34)
+
+    # De-duplicate while preserving order
+    seen = set()
+    dedup_ids = []
+    for pid in all_ids:
+        if pid and pid not in seen:
+            seen.add(pid)
+            dedup_ids.append(pid)
+
+    if not dedup_ids:
+        return pd.DataFrame(), diag
+
+    # EFetch in batches
+    frames = []
+    for i in range(0, len(dedup_ids), 200):
+        batch = dedup_ids[i:i+200]
+        df, ef_urls, warn2 = efetch(batch)
+        diag["efetch_urls"].extend(ef_urls)
+        diag["warnings"].extend(warn2)
+        if not df.empty:
+            frames.append(df)
+        time.sleep(0.34)
+
+    if not frames:
+        return pd.DataFrame(), diag
+    out = pd.concat(frames, ignore_index=True)
+
+    # Ensure standard columns exist
+    for c in ["PMID","Title","Abstract","Year","FirstAuthor","Journal","DOI","PubMedURL","PMC","PMCID"]:
+        if c not in out.columns:
+            out[c] = ""
+
+    return out, diag
+
 
 # =========================================================
 # Screening heuristics (fallback when no LLM)
@@ -1338,14 +1417,14 @@ def run_pipeline():
         st.session_state["pubmed_query"] = auto_q
 
     # Fetch pubmed
-    df, diag = fetch_pubmed(st.session_state["pubmed_query"], max_records=200)
+    df, diag = fetch_pubmed(st.session_state["pubmed_query"], max_records=int(st.session_state.get("max_pubmed_records",1000) or 1000), page_size=int(st.session_state.get("pubmed_page_size",200) or 200))
     st.session_state["pubmed_records"] = df
     st.session_state["diagnostics"] = diag
 
     # Feasibility: SR/MA/NMA scan (quick)
     feas_q = f"({auto_q}) AND (systematic review[pt] OR meta-analysis[pt] OR \"systematic review\"[tiab] OR \"meta-analysis\"[tiab] OR \"network meta-analysis\"[tiab] OR NMA[tiab])"
     st.session_state["feas_query"] = feas_q
-    hits, _ = fetch_pubmed(feas_q, max_records=40)
+    hits, _ = fetch_pubmed(feas_q, max_records=40, page_size=int(st.session_state.get('pubmed_page_size',200) or 200))
     st.session_state["srma_hits"] = hits
 
     # Title/abstract AI suggestion
@@ -1402,6 +1481,146 @@ def run_pipeline():
         if pmid not in st.session_state["ft_decision"]:
             st.session_state["ft_decision"][pmid] = "Not reviewed"
             st.session_state["ft_reason"][pmid] = ""
+
+
+def _current_pmids() -> set:
+    df = st.session_state.get("pubmed_records")
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty or "PMID" not in df.columns:
+        return set()
+    return set(str(x) for x in df["PMID"].astype(str).tolist() if str(x).strip())
+
+
+def _prune_dict(d: Dict[str, Any], keep: set) -> Dict[str, Any]:
+    if not isinstance(d, dict):
+        return {}
+    return {k: v for k, v in d.items() if str(k) in keep}
+
+
+def _prune_after_refetch():
+    """Keep user work for records still present; drop the rest to avoid mismatch."""
+    keep = _current_pmids()
+    st.session_state["ta_ai"] = _prune_dict(st.session_state.get("ta_ai", {}), keep)
+    st.session_state["ta_ai_reason"] = _prune_dict(st.session_state.get("ta_ai_reason", {}), keep)
+    st.session_state["ta_ai_conf"] = _prune_dict(st.session_state.get("ta_ai_conf", {}), keep)
+    st.session_state["ta_override"] = _prune_dict(st.session_state.get("ta_override", {}), keep)
+    st.session_state["ta_override_reason"] = _prune_dict(st.session_state.get("ta_override_reason", {}), keep)
+
+    st.session_state["ft_decision"] = _prune_dict(st.session_state.get("ft_decision", {}), keep)
+    st.session_state["ft_reason"] = _prune_dict(st.session_state.get("ft_reason", {}), keep)
+    st.session_state["ft_pdf"] = _prune_dict(st.session_state.get("ft_pdf", {}), keep)
+    st.session_state["ft_text"] = _prune_dict(st.session_state.get("ft_text", {}), keep)
+
+    ex = st.session_state.get("extract_df")
+    if isinstance(ex, pd.DataFrame) and not ex.empty and "PMID" in ex.columns:
+        st.session_state["extract_df"] = ex[ex["PMID"].astype(str).isin(keep)].reset_index(drop=True)
+
+    rb = st.session_state.get("rob2_df")
+    if isinstance(rb, pd.DataFrame) and not rb.empty and "PMID" in rb.columns:
+        st.session_state["rob2_df"] = rb[rb["PMID"].astype(str).isin(keep)].reset_index(drop=True)
+
+
+def _llm_enabled() -> bool:
+    return bool(
+        st.session_state.get("byok_enabled")
+        and st.session_state.get("byok_consent")
+        and (st.session_state.get("byok_base_url") or "").strip()
+        and (st.session_state.get("byok_model") or "").strip()
+        and (st.session_state.get("byok_key") or "").strip()
+    )
+
+
+def compute_ta_suggestions(proto: Protocol, df: pd.DataFrame):
+    """Compute AI (or heuristic) title/abstract screening suggestions for FULL-TEXT."""
+    ta_ai: Dict[str, str] = {}
+    ta_reason: Dict[str, str] = {}
+    ta_conf: Dict[str, float] = {}
+
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        st.session_state["ta_ai"] = {}
+        st.session_state["ta_ai_reason"] = {}
+        st.session_state["ta_ai_conf"] = {}
+        return
+
+    # Build payload for LLM
+    payload = []
+    for _, r in df.iterrows():
+        payload.append({
+            "PMID": str(r.get("PMID","")),
+            "Title": str(r.get("Title","") or ""),
+            "Abstract": str(r.get("Abstract","") or "")[:3500],
+            "Year": str(r.get("Year","") or ""),
+            "FirstAuthor": str(r.get("FirstAuthor","") or ""),
+            "Journal": str(r.get("Journal","") or ""),
+        })
+
+    if _llm_enabled():
+        try:
+            sys = (
+                "You are screening PubMed records for a systematic review/meta-analysis. "
+                "Given PICO and a list of records, label each record as Include/Exclude/Unsure for FULL-TEXT review, "
+                "and provide a concise rationale and a confidence 0-1. "
+                "Do not fabricate. Return STRICT JSON: {pmid: {label, reason, confidence}}."
+            )
+            user = json.dumps({"PICO": proto.to_dict().get("pico"), "records": payload}, ensure_ascii=False)
+            d = llm_json(sys, user, max_tokens=1700) or {}
+            for rec in payload:
+                pmid = str(rec.get("PMID",""))
+                item = d.get(pmid) or d.get(str(pmid)) or {}
+                lbl = str(item.get("label") or "Unsure").strip()
+                if lbl not in ["Include","Exclude","Unsure"]:
+                    lbl = "Unsure"
+                ta_ai[pmid] = lbl
+                ta_reason[pmid] = str(item.get("reason") or "").strip()
+                try:
+                    cf = float(item.get("confidence", 0.5))
+                except Exception:
+                    cf = 0.5
+                ta_conf[pmid] = max(0.0, min(1.0, cf))
+        except Exception as e:
+            # Fall back to heuristic
+            for _, r in df.iterrows():
+                pmid = str(r.get("PMID",""))
+                lbl, rs, cf = heuristic_ta(proto, r)
+                ta_ai[pmid] = lbl
+                ta_reason[pmid] = rs
+                ta_conf[pmid] = cf
+    else:
+        for _, r in df.iterrows():
+            pmid = str(r.get("PMID",""))
+            lbl, rs, cf = heuristic_ta(proto, r)
+            ta_ai[pmid] = lbl
+            ta_reason[pmid] = rs
+            ta_conf[pmid] = cf
+
+    st.session_state["ta_ai"] = ta_ai
+    st.session_state["ta_ai_reason"] = ta_reason
+    st.session_state["ta_ai_conf"] = ta_conf
+
+
+def refetch_pubmed_and_sync():
+    """Re-fetch PubMed using the (possibly manually edited) query and re-sync downstream steps."""
+    q = (st.session_state.get("pubmed_query") or "").strip()
+    if not q:
+        return
+    max_n = int(st.session_state.get("max_pubmed_records", 1000) or 1000)
+    page_size = int(st.session_state.get("pubmed_page_size", 200) or 200)
+
+    df, diag = fetch_pubmed(q, max_records=max_n, page_size=page_size)
+    st.session_state["pubmed_records"] = df
+    st.session_state["diagnostics"] = diag
+
+    # Feasibility query should follow CURRENT query (not the old auto_q)
+    feas_q = f"({q}) AND (systematic review[pt] OR meta-analysis[pt] OR \"systematic review\"[tiab] OR \"meta analysis\"[tiab] OR \"network meta-analysis\"[tiab] OR NMA[tiab])"
+    st.session_state["feas_query"] = feas_q
+    hits, _ = fetch_pubmed(feas_q, max_records=60, page_size=page_size)
+    st.session_state["srma_hits"] = hits
+
+    proto = st.session_state.get("protocol")
+    if proto and isinstance(proto, Protocol):
+        compute_ta_suggestions(proto, df)
+
+    # Keep only work that still matches current PMIDs
+    _prune_after_refetch()
 
 if run_clicked:
     run_pipeline()
@@ -1473,10 +1692,11 @@ with tabs[1]:
         cA, cB, cC = st.columns([1,1,2])
         with cA:
             if st.button(t("pubmed_refetch"), type="primary"):
-                df, diag = fetch_pubmed(st.session_state["pubmed_query"], max_records=200)
-                st.session_state["pubmed_records"] = df
-                st.session_state["diagnostics"] = diag
+                refetch_pubmed_and_sync()
+                df = st.session_state.get("pubmed_records", pd.DataFrame())
+                diag = st.session_state.get("diagnostics", {})
                 st.success(f"抓到 {df.shape[0]} 篇（PubMed count={diag.get('pubmed_total_count',0)}）。")
+                st.info("已使用手動 PubMed query 重新抓取並同步後續步驟；若先前已有人工標記/抽取，系統僅保留仍存在於目前 records 的部分。")
         with cB:
             if st.button(t("pubmed_restore")):
                 st.session_state["pubmed_query"] = st.session_state.get("pubmed_query_auto","")
@@ -2164,7 +2384,10 @@ with tabs[9]:
     diag = st.session_state.get("diagnostics") or {}
     st.caption("當 PubMed 被擋（回 HTML / 403 / 連線失敗）時，這裡最重要。")
     st.json(diag)
-    if diag.get("esearch_url"):
+    if diag.get("esearch_urls"):
+        st.write("esearch_urls:")
+        st.code("\n".join(diag.get("esearch_urls", [])), language="text")
+    elif diag.get("esearch_url"):
         st.write("esearch_url:")
         st.code(diag["esearch_url"], language="text")
     if diag.get("efetch_urls"):
