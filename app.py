@@ -686,132 +686,27 @@ def expand_terms(text: str) -> List[str]:
             out.append(s2)
     return out
 
-
-
-# =========================================================
-# MeSH lookup (NCBI eUtils) - best-effort, cached
-# =========================================================
-def contains_cjk(s: str) -> bool:
-    return bool(re.search(r"[\u4e00-\u9fff]", s or ""))
-
-def extract_english_tokens(s: str) -> str:
-    """Keep Latin tokens/numbers and 'vs' as a minimal English seed."""
-    s = (s or "").strip()
-    if not s:
-        return ""
-    tokens = re.findall(r"[A-Za-z0-9][A-Za-z0-9\-\+\/\.]*|\bvs\b", s, flags=re.IGNORECASE)
-    out = " ".join(tokens)
-    out = re.sub(r"\s+", " ", out).strip()
-    return out
-
-def _mesh_cache_get() -> dict:
-    st.session_state.setdefault("_mesh_cache", {})
-    return st.session_state["_mesh_cache"]
-
-def mesh_lookup_ncbi(term: str, retmax: int = 5) -> list:
-    """Return MeSH heading candidates for a free-text term (English preferred).
-    Uses NCBI eUtils db=mesh (esearch + esummary). Cached per normalized term.
-    Returns [] on failure.
-    """
-    t = (term or "").strip()
-    if not t:
-        return []
-    key = re.sub(r"\s+", " ", t.lower()).strip()
-    cache = _mesh_cache_get()
-    if key in cache:
-        return cache[key]
-    try:
-        import requests
-        base = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
-        r = requests.get(base + "esearch.fcgi", params={"db":"mesh","term":t,"retmode":"json","retmax":str(retmax)}, timeout=15)
-        if r.status_code != 200:
-            cache[key] = []
-            return []
-        j = r.json()
-        ids = (j.get("esearchresult", {}) or {}).get("idlist", []) or []
-        if not ids:
-            cache[key] = []
-            return []
-        r2 = requests.get(base + "esummary.fcgi", params={"db":"mesh","id":",".join(ids),"retmode":"json"}, timeout=15)
-        if r2.status_code != 200:
-            cache[key] = []
-            return []
-        j2 = r2.json()
-        result = j2.get("result", {}) or {}
-        out = []
-        seen = set()
-        for _id in ids:
-            doc = result.get(str(_id), {}) or {}
-            title = (doc.get("title") or "").strip()
-            if not title:
-                continue
-            title = re.sub(r"\s*\([^\)]*\)\s*$", "", title).strip()
-            k = title.lower()
-            if k and k not in seen:
-                seen.add(k)
-                out.append(title)
-        cache[key] = out
-        return out
-    except Exception:
-        cache[key] = []
-        return []
-
 def propose_mesh_candidates(terms: List[str]) -> List[str]:
-    """Propose MeSH headings for a list of terms.
-
-    - Offline heuristics for common concepts (fast).
-    - Online NCBI MeSH lookup (esearch/esummary) for broader coverage (cached).
-    """
     mesh = []
-
-    # (1) lightweight heuristics
     for t0 in terms or []:
-        tl = (t0 or "").lower()
+        tl = t0.lower()
         if "cataract" in tl:
             mesh += ["Cataract", "Cataract Extraction"]
         if "glaucoma" in tl:
             mesh += ["Glaucoma"]
-        if "intraocular lens" in tl or "iol" in tl:
+        if "intraocular lens" in tl or "iol" in tl or "lens" in tl:
             mesh += ["Lenses, Intraocular", "Lens Implantation, Intraocular"]
-        if "keratoplasty" in tl:
-            mesh += ["Keratoplasty"]
-        if "phaco" in tl:
-            mesh += ["Phacoemulsification"]
-        if "astigmat" in tl:
-            mesh += ["Astigmatism"]
-        if "visual acuity" in tl or "bcva" in tl:
-            mesh += ["Visual Acuity"]
-
-    # (2) NCBI MeSH lookup (best-effort)
-    try:
-        for t0 in (terms or []):
-            t = (t0 or "").strip()
-            if not t:
-                continue
-            if contains_cjk(t):
-                t = extract_english_tokens(t)
-            if not t or len(t) < 3:
-                continue
-            # limit to 2 per term to avoid bloating query
-            mesh += (mesh_lookup_ncbi(t, retmax=6)[:2] or [])
-    except Exception:
-        pass
-
     out, seen = [], set()
     for m0 in mesh:
-        k = (m0 or "").strip().lower()
-        if k and k not in seen:
+        k = m0.lower()
+        if k not in seen:
             seen.add(k)
-            out.append(m0.strip())
+            out.append(m0)
     return out
 
 def question_to_protocol_heuristic(question: str) -> Protocol:
     q = norm_text(question)
     left, right = split_vs(q)
-    if (not left and not right) and contains_cjk(q):
-        q2 = extract_english_tokens(q)
-        if q2:
-            left, right = split_vs(q2)
     proto = Protocol(P="", I=left, C=right, O="", goal_mode=st.session_state.get("goal_mode","Fast / feasible (gap-fill)"))
     if proto.I and proto.C and proto.I.strip().lower() == proto.C.strip().lower():
         proto.C = "other comparator (different model/design)"
@@ -831,9 +726,7 @@ def question_to_protocol_llm(question: str) -> Tuple[Protocol, str]:
     If LLM unavailable, falls back to heuristic and uses original question as question_en.
     """
     if not llm_available():
-        q0 = norm_text(question)
-        q_en = extract_english_tokens(q0) if contains_cjk(q0) else q0
-        return question_to_protocol_heuristic(question), (q_en or q0)
+        return question_to_protocol_heuristic(question), norm_text(question)
 
     sys = (
         "You are an evidence synthesis assistant. "
@@ -920,12 +813,7 @@ def build_pubmed_query(proto: Protocol, article_type: str, custom_filter: str) -
 
     blocks = [b for b in [P_block, I_block, C_block, O_block] if b]
     if not blocks:
-        q_en = norm_text(st.session_state.get("question_en") or "")
-        q0 = norm_text(st.session_state.get("question") or "")
-        if not q_en and contains_cjk(q0):
-            q_en = extract_english_tokens(q0)
-        # If still empty, do NOT fall back to CJK text; leave empty and let UI prompt user.
-        blocks = [quote_tiab(q_en)] if q_en else []
+        blocks = [quote_tiab(norm_text(st.session_state.get("question_en") or st.session_state.get("question") or ""))]
 
     q = " AND ".join([f"({b})" if " OR " in b else b for b in blocks if b])
 
@@ -1553,22 +1441,6 @@ col1, col2 = st.columns([2,1])
 with col1:
     st.markdown(f"**{t('question_notice')}**")
     st.text_input(t("question_label"), key="question", help=t("question_help"))
-
-# English query seed (recommended for PubMed; especially when the question is Chinese)
-q_now = st.session_state.get("question","") or ""
-# auto-fill once per new question if user hasn't edited it
-if st.session_state.get("_question_en_src","") != q_now and not (st.session_state.get("question_en") or "").strip():
-    if contains_cjk(q_now):
-        st.session_state["question_en"] = extract_english_tokens(q_now)
-    else:
-        st.session_state["question_en"] = norm_text(q_now)
-    st.session_state["_question_en_src"] = q_now
-
-with st.expander("English query seed（PubMed 建議用英文；可手動修正）", expanded=contains_cjk(q_now)):
-    st.text_input("English keywords / question", key="question_en",
-                  help="若未啟用 LLM，系統無法可靠翻譯中文；請至少輸入英文關鍵字（例如：diffractive EDOF IOL vs nondiffractive EDOF）。")
-    if contains_cjk(q_now) and not (st.session_state.get("question_en") or "").strip():
-        st.warning("偵測到中文問句但缺少英文關鍵字：PubMed 檢索品質會很差。請在此輸入英文關鍵字，或在側邊欄啟用 LLM（使用者自備 key）做自動翻譯與同義詞/MeSH 擴充。")
 with col2:
     st.markdown("**Run**")
     run_clicked = st.button(t("run"), type="primary")
@@ -1605,9 +1477,6 @@ def run_pipeline():
     # Auto build query
     auto_q = build_pubmed_query(proto, st.session_state.get("article_type","不限"), st.session_state.get("custom_pubmed_filter",""))
     st.session_state["pubmed_query_auto"] = auto_q
-    if not auto_q.strip():
-        st.warning("無法自動產生有效的英文 PubMed 搜尋式：請在首頁的 English query seed 輸入英文關鍵字，或啟用 LLM（使用者自備 key）以自動翻譯與擴充同義詞/MeSH。")
-        return
     # If user hasn't edited manually yet, set pubmed_query to auto
     if not st.session_state.get("pubmed_query"):
         st.session_state["pubmed_query"] = auto_q
