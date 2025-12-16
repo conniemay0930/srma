@@ -454,6 +454,10 @@ def init_state():
     ss.setdefault("byok_key", "")
     ss.setdefault("byok_base_url", "https://api.openai.com/v1")
     ss.setdefault("byok_model", "gpt-4o-mini")
+    ss.setdefault("byok_provider", "OpenAI")
+    ss.setdefault("byok_model_choice", "gpt-4o-mini")
+    ss.setdefault("byok_base_url_custom", "")
+    ss.setdefault("byok_model_custom", "")
     ss.setdefault("byok_temp", 0.2)
     ss.setdefault("byok_consent", False)
 
@@ -600,8 +604,72 @@ with st.sidebar:
     st.checkbox(t("byok_toggle"), key="byok_enabled")
     st.caption(t("byok_notice"))
     st.session_state["byok_consent"] = st.checkbox(t("byok_consent"), value=bool(st.session_state.get("byok_consent", False)))
-    st.text_input("Base URL (OpenAI-compatible)", key="byok_base_url")
-    st.text_input("Model", key="byok_model")
+    # Provider / model dropdowns (OpenAI-compatible endpoints)
+    PROVIDERS = {
+        "OpenAI": {
+            "base_url": "https://api.openai.com/v1",
+            "models": ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini", "gpt-4.1"],
+        },
+        "OpenRouter": {
+            "base_url": "https://openrouter.ai/api/v1",
+            "models": ["openai/gpt-4o-mini", "anthropic/claude-3.5-sonnet", "google/gemini-1.5-pro"],
+        },
+        "Groq": {
+            "base_url": "https://api.groq.com/openai/v1",
+            "models": ["llama-3.1-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768"],
+        },
+        "Together": {
+            "base_url": "https://api.together.xyz/v1",
+            "models": ["meta-llama/Llama-3.1-70B-Instruct-Turbo", "mistralai/Mixtral-8x7B-Instruct-v0.1"],
+        },
+        "Fireworks": {
+            "base_url": "https://api.fireworks.ai/inference/v1",
+            "models": ["accounts/fireworks/models/llama-v3p1-70b-instruct"],
+        },
+        "DeepInfra": {
+            "base_url": "https://api.deepinfra.com/v1/openai",
+            "models": ["meta-llama/Meta-Llama-3.1-70B-Instruct"],
+        },
+        "Ollama（本機）": {
+            "base_url": "http://localhost:11434/v1",
+            "models": ["llama3.1", "qwen2.5:14b", "mistral"],
+        },
+        "自訂（OpenAI-compatible）": {
+            "base_url": st.session_state.get("byok_base_url", "https://api.openai.com/v1"),
+            "models": [],
+        },
+    }
+
+    # Infer initial provider once
+    if "byok_provider" not in st.session_state or not st.session_state.get("byok_provider"):
+        st.session_state["byok_provider"] = "OpenAI"
+
+    st.selectbox("常見 AI 平台", options=list(PROVIDERS.keys()), key="byok_provider")
+    prov = st.session_state.get("byok_provider", "OpenAI")
+    prov_cfg = PROVIDERS.get(prov, PROVIDERS["OpenAI"])
+
+    # If not custom, sync base_url and show model dropdown
+    if prov != "自訂（OpenAI-compatible）":
+        if st.session_state.get("byok_base_url") != prov_cfg["base_url"]:
+            st.session_state["byok_base_url"] = prov_cfg["base_url"]
+
+        models = prov_cfg.get("models", [])
+        if models:
+            default_model = st.session_state.get("byok_model", models[0])
+            if default_model not in models:
+                default_model = models[0]
+            st.selectbox("模型（下拉）", options=models, index=models.index(default_model), key="byok_model_choice")
+            st.session_state["byok_model"] = st.session_state.get("byok_model_choice", default_model)
+        else:
+            st.text_input("Model", key="byok_model")
+        with st.expander("進階：Base URL / Model（必要時手動改）", expanded=False):
+            st.text_input("Base URL (OpenAI-compatible)", key="byok_base_url")
+            st.text_input("Model（手動）", key="byok_model")
+    else:
+        st.text_input("Base URL (OpenAI-compatible)", key="byok_base_url")
+        st.text_input("Model", key="byok_model")
+
+    st.caption("提示：不同平台的 model id 可能不同；若下拉沒有你要的，可在『進階』或自訂模式手動輸入。")
     st.text_input("API Key", type="password", key="byok_key")
     st.slider("Temperature", 0.0, 1.0, float(st.session_state.get("byok_temp",0.2)), 0.05, key="byok_temp")
     st.button(t("byok_clear"), on_click=lambda: st.session_state.update({"byok_key": ""}))
@@ -645,6 +713,85 @@ ARTICLE_TYPE_FILTERS = {
 
 def has_cjk(s: str) -> bool:
     return bool(re.search(r"[\u4e00-\u9fff]", s or ""))
+
+
+def englishize_question_fallback(question: str) -> str:
+    """Best-effort fallback to produce an English-ish keyword string from a non-English question.
+    - If the question contains CJK, keep only Latin tokens/numbers and common comparators (vs/versus).
+    - This will NOT be a true translation; it is a safe fallback to avoid sending Chinese into PubMed.
+    """
+    q = norm_text(question)
+    if not q:
+        return ""
+    if has_cjk(q):
+        tokens = re.findall(r"[A-Za-z0-9\-\+\/\.]+|vs|VS|versus", q)
+        q = " ".join(tokens)
+    q = re.sub(r"\s+", " ", q).strip()
+    return q
+
+def rule_based_pubmed_query_from_question(question: str, article_type: str, custom_filter: str, not_clause: str) -> str:
+    """Build a conservative PubMed query from the one-sentence question without using an LLM."""
+    q_en = englishize_question_fallback(question) or norm_text(question)
+    q_en = q_en.strip()
+
+    # handle A vs B pattern if possible
+    parts = re.split(r"\bvs\b|\bVS\b|\bversus\b", q_en)
+    parts = [p.strip() for p in parts if p.strip()]
+    if len(parts) >= 2:
+        base = f'(\"{parts[0]}\"[tiab]) AND (\"{parts[1]}\"[tiab])'
+    else:
+        base = f'(\"{q_en}\"[tiab])' if q_en else '(\"\"[tiab])'
+
+    f = ARTICLE_TYPE_FILTERS.get(article_type, "")
+    if f.strip():
+        base = f"({base}) AND ({f})"
+
+    if (custom_filter or "").strip():
+        base = f"({base}) AND ({custom_filter.strip()})"
+
+    if (not_clause or "").strip():
+        base = f"({base}) NOT ({not_clause.strip()})"
+
+    return base
+
+def llm_generate_pubmed_query_from_proto(question: str, proto: 'Protocol', article_type: str, custom_filter: str) -> str:
+    """Use BYOK LLM to translate the question/PICO to English and produce a high-recall PubMed query."""
+    sys = (
+        "You are an expert medical librarian for evidence synthesis. "
+        "Given a clinical question (may be non-English) and a draft PICO, "
+        "produce a high-recall PubMed boolean query in English. "
+        "Return ONLY the query string. No code fences, no explanation."
+    )
+    user = f"""Clinical question (may be non-English):
+{question}
+
+Draft PICO (may be incomplete):
+P: {getattr(proto,'P','')}
+I: {getattr(proto,'I','')}
+C: {getattr(proto,'C','')}
+O: {getattr(proto,'O','')}
+
+Synonyms (if any):
+P_syn: {', '.join(getattr(proto,'P_syn',[]) or [])}
+I_syn: {', '.join(getattr(proto,'I_syn',[]) or [])}
+C_syn: {', '.join(getattr(proto,'C_syn',[]) or [])}
+O_syn: {', '.join(getattr(proto,'O_syn',[]) or [])}
+
+MeSH candidates (if any):
+mesh_P: {', '.join(getattr(proto,'mesh_P',[]) or [])}
+mesh_I: {', '.join(getattr(proto,'mesh_I',[]) or [])}
+mesh_C: {', '.join(getattr(proto,'mesh_C',[]) or [])}
+mesh_O: {', '.join(getattr(proto,'mesh_O',[]) or [])}
+
+Requested study/design filter: {article_type}
+Additional custom filter: {custom_filter}
+
+Output a single valid PubMed query string."""
+    out = call_openai_compatible(
+        [{"role": "system", "content": sys}, {"role": "user", "content": user}],
+        max_tokens=900,
+    )
+    return re.sub(r"\s+", " ", (out or "").strip())
 
 def split_vs(question: str) -> Tuple[str, str]:
     q = question or ""
@@ -726,7 +873,7 @@ def question_to_protocol_llm(question: str) -> Tuple[Protocol, str]:
     If LLM unavailable, falls back to heuristic and uses original question as question_en.
     """
     if not llm_available():
-        return question_to_protocol_heuristic(question), norm_text(question)
+        return question_to_protocol_heuristic(question), englishize_question_fallback(question) or norm_text(question)
 
     sys = (
         "You are an evidence synthesis assistant. "
@@ -1754,7 +1901,7 @@ with tabs[1]:
 
         st.markdown("### " + t("pubmed_edit"))
         st.text_area("", key="pubmed_query", height=120)
-        cA, cB, cC = st.columns([1,1,2])
+        cA, cB, cC, cD = st.columns([1,1,1,2])
         with cA:
             if st.button(t("pubmed_refetch"), type="primary"):
                 refetch_pubmed_and_sync()
@@ -1766,6 +1913,31 @@ with tabs[1]:
             if st.button(t("pubmed_restore")):
                 st.session_state["pubmed_query"] = st.session_state.get("pubmed_query_auto","")
         with cC:
+            if st.button("自動轉英文搜尋式", help="優先使用 BYOK LLM；未啟用時改用規則式關鍵字。"):
+                proto: Protocol = st.session_state.get("protocol")
+                question = st.session_state.get("question","")
+                art = st.session_state.get("article_type","不限")
+                custom_f = st.session_state.get("custom_pubmed_filter","")
+                if llm_available():
+                    try:
+                        q_llm = llm_generate_pubmed_query_from_proto(question, proto, art, custom_f)
+                        if q_llm:
+                            st.session_state["pubmed_query_auto"] = q_llm
+                            st.session_state["pubmed_query"] = q_llm
+                            st.success("已用 LLM 產生英文 PubMed 搜尋式（可再手改）。")
+                        else:
+                            raise RuntimeError("Empty LLM output")
+                    except Exception as e:
+                        q_rb = rule_based_pubmed_query_from_question(question, art, custom_f, proto.NOT)
+                        st.session_state["pubmed_query_auto"] = q_rb
+                        st.session_state["pubmed_query"] = q_rb
+                        st.warning("LLM 產生失敗，已改用規則式英文搜尋式（建議手動微調）。")
+                else:
+                    q_rb = rule_based_pubmed_query_from_question(question, art, custom_f, proto.NOT)
+                    st.session_state["pubmed_query_auto"] = q_rb
+                    st.session_state["pubmed_query"] = q_rb
+                    st.info("未啟用 LLM：已用規則式產生英文搜尋式（建議手動補同義詞）。")
+        with cD:
             st.download_button(
                 t("download_query"),
                 data=st.session_state.get("pubmed_query","").encode("utf-8"),
