@@ -494,6 +494,18 @@ def init_state():
     ss.setdefault("ft_pdf", {})        # pmid -> bytes
     ss.setdefault("ft_text", {})       # pmid -> str (extracted or pasted)
 
+    # Full-text work queue + quick-review states (smart handoff)
+    ss.setdefault("ft_queue", [])              # list[str] pmid; Step 4b will prefer only this list when non-empty
+    ss.setdefault("ft_only_pending", True)     # Step 4b: show only Not reviewed by default
+    ss.setdefault("ft_quick_mode", True)       # Step 4b: one-by-one review mode
+    ss.setdefault("ft_auto_next", True)        # Step 4b: auto move to next after decision
+    ss.setdefault("ft_focus_idx", 0)           # Step 4b: current index in queue
+    ss.setdefault("ft_decision_prev", {})      # pmid -> last decision (for change detection)
+
+    ss.setdefault("ta_quick_mode", False)      # Step 3+4: quick review Unsure one-by-one
+    ss.setdefault("ta_auto_next", True)
+    ss.setdefault("ta_focus_idx", 0)
+
     # extraction
     ss.setdefault("extract_schema_text", "")
     ss.setdefault("extract_df", pd.DataFrame())
@@ -634,50 +646,6 @@ ARTICLE_TYPE_FILTERS = {
 def has_cjk(s: str) -> bool:
     return bool(re.search(r"[\u4e00-\u9fff]", s or ""))
 
-def ascii_seed_from_text(s: str) -> str:
-    """Extract an English/ASCII seed from a possibly non-English question.
-    This is a safe fallback when LLM is disabled.
-    """
-    s = norm_text(s)
-    if not s:
-        return ""
-    if not has_cjk(s):
-        return s
-    # keep latin words/numbers and common separators
-    toks = re.findall(r"[A-Za-z0-9][A-Za-z0-9\-\+\/\.]{1,}", s)
-    # expand common abbreviations
-    expanded: List[str] = []
-    for t0 in toks:
-        expanded.append(t0)
-        tu = t0.upper()
-        if tu in ABBR_MAP:
-            expanded.extend(ABBR_MAP[tu])
-    # dedup while keeping order
-    out: List[str] = []
-    seen: set = set()
-    for x in expanded:
-        k = x.lower().strip()
-        if k and k not in seen:
-            seen.add(k)
-            out.append(x)
-    return " ".join(out).strip()
-
-def auto_question_en(question: str) -> str:
-    """Best-effort English version of the research question.
-
-    Priority:
-    - If already English (no CJK), return as-is
-    - Else, extract ASCII seed + expand abbreviations
-    """
-    q = norm_text(question)
-    if not q:
-        return ""
-    if not has_cjk(q):
-        return q
-    return ascii_seed_from_text(q)
-
-
-
 def split_vs(question: str) -> Tuple[str, str]:
     q = question or ""
     m = re.split(r"\s+vs\.?\s+|\s+VS\.?\s+|\s+versus\s+| vs | VS ", q, flags=re.IGNORECASE)
@@ -718,110 +686,154 @@ def expand_terms(text: str) -> List[str]:
             out.append(s2)
     return out
 
-def propose_mesh_candidates(terms: List[str]) -> List[str]:
-    """Heuristic MeSH candidate proposer.
 
-    Design goals:
-    - Never raise errors (safe offline / blocked environments)
-    - Provide reasonable default MeSH headings for common ophthalmology & lens topics
-    - Keep lists short and deduplicated
+
+# =========================================================
+# MeSH lookup (NCBI eUtils) - best-effort, cached
+# =========================================================
+def contains_cjk(s: str) -> bool:
+    return bool(re.search(r"[\u4e00-\u9fff]", s or ""))
+
+def extract_english_tokens(s: str) -> str:
+    """Keep Latin tokens/numbers and 'vs' as a minimal English seed."""
+    s = (s or "").strip()
+    if not s:
+        return ""
+    tokens = re.findall(r"[A-Za-z0-9][A-Za-z0-9\-\+\/\.]*|\bvs\b", s, flags=re.IGNORECASE)
+    out = " ".join(tokens)
+    out = re.sub(r"\s+", " ", out).strip()
+    return out
+
+def _mesh_cache_get() -> dict:
+    st.session_state.setdefault("_mesh_cache", {})
+    return st.session_state["_mesh_cache"]
+
+def mesh_lookup_ncbi(term: str, retmax: int = 5) -> list:
+    """Return MeSH heading candidates for a free-text term (English preferred).
+    Uses NCBI eUtils db=mesh (esearch + esummary). Cached per normalized term.
+    Returns [] on failure.
     """
-    mesh: List[str] = []
-    for t0 in (terms or []):
-        tl = (t0 or "").lower()
+    t = (term or "").strip()
+    if not t:
+        return []
+    key = re.sub(r"\s+", " ", t.lower()).strip()
+    cache = _mesh_cache_get()
+    if key in cache:
+        return cache[key]
+    try:
+        import requests
+        base = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
+        r = requests.get(base + "esearch.fcgi", params={"db":"mesh","term":t,"retmode":"json","retmax":str(retmax)}, timeout=15)
+        if r.status_code != 200:
+            cache[key] = []
+            return []
+        j = r.json()
+        ids = (j.get("esearchresult", {}) or {}).get("idlist", []) or []
+        if not ids:
+            cache[key] = []
+            return []
+        r2 = requests.get(base + "esummary.fcgi", params={"db":"mesh","id":",".join(ids),"retmode":"json"}, timeout=15)
+        if r2.status_code != 200:
+            cache[key] = []
+            return []
+        j2 = r2.json()
+        result = j2.get("result", {}) or {}
+        out = []
+        seen = set()
+        for _id in ids:
+            doc = result.get(str(_id), {}) or {}
+            title = (doc.get("title") or "").strip()
+            if not title:
+                continue
+            title = re.sub(r"\s*\([^\)]*\)\s*$", "", title).strip()
+            k = title.lower()
+            if k and k not in seen:
+                seen.add(k)
+                out.append(title)
+        cache[key] = out
+        return out
+    except Exception:
+        cache[key] = []
+        return []
 
-        # Cataract / lens surgery
+def propose_mesh_candidates(terms: List[str]) -> List[str]:
+    """Propose MeSH headings for a list of terms.
+
+    - Offline heuristics for common concepts (fast).
+    - Online NCBI MeSH lookup (esearch/esummary) for broader coverage (cached).
+    """
+    mesh = []
+
+    # (1) lightweight heuristics
+    for t0 in terms or []:
+        tl = (t0 or "").lower()
         if "cataract" in tl:
             mesh += ["Cataract", "Cataract Extraction"]
-        if "phaco" in tl or "phacoemulsification" in tl:
-            mesh += ["Phacoemulsification"]
-        if "femtosecond" in tl or "flacs" in tl:
-            mesh += ["Femtosecond Laser Surgery"]
-
-        # Intraocular lens / EDOF / multifocal
-        if ("intraocular lens" in tl or "intra-ocular lens" in tl or "iol" in tl or
-            "lens" in tl or "edof" in tl or "extended depth" in tl or "extended range" in tl or
-            "multifocal" in tl or "monofocal" in tl or "diffractive" in tl or "nondiffractive" in tl or "non-diffractive" in tl):
-            mesh += ["Lenses, Intraocular", "Lens Implantation, Intraocular"]
-
-        # Glaucoma / glaucoma surgery
         if "glaucoma" in tl:
             mesh += ["Glaucoma"]
-        if "trabeculectomy" in tl:
-            mesh += ["Trabeculectomy"]
-        if "tube" in tl and "shunt" in tl:
-            mesh += ["Glaucoma Drainage Implants"]
-
-        # Outcomes (common)
+        if "intraocular lens" in tl or "iol" in tl:
+            mesh += ["Lenses, Intraocular", "Lens Implantation, Intraocular"]
+        if "keratoplasty" in tl:
+            mesh += ["Keratoplasty"]
+        if "phaco" in tl:
+            mesh += ["Phacoemulsification"]
+        if "astigmat" in tl:
+            mesh += ["Astigmatism"]
         if "visual acuity" in tl or "bcva" in tl:
             mesh += ["Visual Acuity"]
-        if "contrast" in tl and "sensit" in tl:
-            mesh += ["Contrast Sensitivity"]
-        if "photic" in tl or "halo" in tl or "glare" in tl:
-            mesh += ["Glare"]
 
-        # Study design hints
-        if "random" in tl or "trial" in tl:
-            mesh += ["Randomized Controlled Trials as Topic"]
-        if "meta-analysis" in tl or "systematic review" in tl:
-            mesh += ["Meta-Analysis as Topic", "Systematic Reviews as Topic"]
+    # (2) NCBI MeSH lookup (best-effort)
+    try:
+        for t0 in (terms or []):
+            t = (t0 or "").strip()
+            if not t:
+                continue
+            if contains_cjk(t):
+                t = extract_english_tokens(t)
+            if not t or len(t) < 3:
+                continue
+            # limit to 2 per term to avoid bloating query
+            mesh += (mesh_lookup_ncbi(t, retmax=6)[:2] or [])
+    except Exception:
+        pass
 
-    out: List[str] = []
-    seen: set = set()
+    out, seen = [], set()
     for m0 in mesh:
-        k = m0.lower().strip()
+        k = (m0 or "").strip().lower()
         if k and k not in seen:
             seen.add(k)
-            out.append(m0)
+            out.append(m0.strip())
     return out
 
 def question_to_protocol_heuristic(question: str) -> Protocol:
     q = norm_text(question)
     left, right = split_vs(q)
-
-    # Best-effort English seeds (important when question contains CJK and LLM is disabled)
-    left_seed = ascii_seed_from_text(left)
-    right_seed = ascii_seed_from_text(right)
-
-    I0 = left_seed or left
-    C0 = right_seed or right
-
-    proto = Protocol(P="", I=I0, C=C0, O="", goal_mode=st.session_state.get("goal_mode", "Fast / feasible (gap-fill)"))
-
-    # If comparator equals intervention (e.g., "EDOF vs EDOF"), drop C to avoid zero-hit AND blocks
+    if (not left and not right) and contains_cjk(q):
+        q2 = extract_english_tokens(q)
+        if q2:
+            left, right = split_vs(q2)
+    proto = Protocol(P="", I=left, C=right, O="", goal_mode=st.session_state.get("goal_mode","Fast / feasible (gap-fill)"))
     if proto.I and proto.C and proto.I.strip().lower() == proto.C.strip().lower():
-        proto.C = ""
-
+        proto.C = "other comparator (different model/design)"
     proto.P_syn = expand_terms(proto.P)
     proto.I_syn = expand_terms(proto.I)
     proto.C_syn = expand_terms(proto.C)
     proto.O_syn = expand_terms(proto.O)
-
-    # Add context for EDOF / IOL comparisons if missing (keeps recall closer to manual searches)
-    i_syn_l = " ".join([x.lower() for x in (proto.I_syn or [])])
-    if ("edof" in i_syn_l or "extended depth" in i_syn_l or "extended range" in i_syn_l) and ("intraocular lens" not in i_syn_l and "iol" not in i_syn_l):
-        proto.I_syn.extend(["intraocular lens", "IOL"])
-
     proto.mesh_P = propose_mesh_candidates(proto.P_syn)
     proto.mesh_I = propose_mesh_candidates(proto.I_syn)
     proto.mesh_C = propose_mesh_candidates(proto.C_syn)
     proto.mesh_O = propose_mesh_candidates(proto.O_syn)
-
     return proto
 
 def question_to_protocol_llm(question: str) -> Tuple[Protocol, str]:
-    """Return (protocol, question_en).
-
-    - If BYOK LLM is enabled: translate to English, propose PICO, expansions, and MeSH candidates.
-    - If LLM is disabled/unavailable: use heuristic PICO and best-effort English seed extraction to avoid
-      sending CJK text directly to PubMed.
+    """
+    Returns (protocol, question_en).
+    If LLM unavailable, falls back to heuristic and uses original question as question_en.
     """
     if not llm_available():
-        proto = question_to_protocol_heuristic(question)
-        q_en = auto_question_en(question)
-        if not q_en:
-            q_en = norm_text(question)
-        return proto, q_en
+        q0 = norm_text(question)
+        q_en = extract_english_tokens(q0) if contains_cjk(q0) else q0
+        return question_to_protocol_heuristic(question), (q_en or q0)
 
     sys = (
         "You are an evidence synthesis assistant. "
@@ -831,27 +843,16 @@ def question_to_protocol_llm(question: str) -> Tuple[Protocol, str]:
         "(3) propose search expansions (synonyms/acronyms) and MeSH candidates. "
         "Return STRICT JSON with keys: question_en, P, I, C, O, NOT, P_syn, I_syn, C_syn, O_syn, mesh_P, mesh_I, mesh_C, mesh_O."
     )
-    user = json.dumps(
-        {
-            "question": question,
-            "article_type": st.session_state.get("article_type", "不限"),
-            "goal_mode": st.session_state.get("goal_mode", "Fast / feasible (gap-fill)"),
-            "default_NOT": st.session_state.get("default_NOT", "animal OR mice OR rat OR in vitro OR case report"),
-        },
-        ensure_ascii=False,
-    )
-
-    d = llm_json(sys, user, max_tokens=1600) or {}
-
-    q_en = norm_text(d.get("question_en") or "") or auto_question_en(question)
-
+    user = f"Question: {question}\nReturn JSON only."
+    d = llm_json(sys, user, max_tokens=900) or {}
+    q_en = norm_text(d.get("question_en") or "")
     proto = Protocol(
         P=norm_text(d.get("P") or ""),
         I=norm_text(d.get("I") or ""),
         C=norm_text(d.get("C") or ""),
         O=norm_text(d.get("O") or ""),
-        NOT=norm_text(d.get("NOT") or st.session_state.get("default_NOT") or ""),
-        goal_mode=st.session_state.get("goal_mode", "Fast / feasible (gap-fill)"),
+        NOT=norm_text(d.get("NOT") or "animal OR mice OR rat OR in vitro OR case report"),
+        goal_mode=st.session_state.get("goal_mode","Fast / feasible (gap-fill)"),
         P_syn=[norm_text(x) for x in (d.get("P_syn") or []) if norm_text(x)],
         I_syn=[norm_text(x) for x in (d.get("I_syn") or []) if norm_text(x)],
         C_syn=[norm_text(x) for x in (d.get("C_syn") or []) if norm_text(x)],
@@ -861,19 +862,17 @@ def question_to_protocol_llm(question: str) -> Tuple[Protocol, str]:
         mesh_C=[norm_text(x) for x in (d.get("mesh_C") or []) if norm_text(x)],
         mesh_O=[norm_text(x) for x in (d.get("mesh_O") or []) if norm_text(x)],
     )
-
-    # If LLM returned empty protocol, fall back to heuristic
+    # fallback: if any field blank, use heuristic fill
     if not (proto.I or proto.C or proto.P or proto.O):
         proto2 = question_to_protocol_heuristic(question)
         proto.P, proto.I, proto.C, proto.O = proto2.P, proto2.I, proto2.C, proto2.O
-
-    # If comparator equals intervention, drop comparator axis to avoid over-restrictive AND
-    if proto.I and proto.C and proto.I.strip().lower() == proto.C.strip().lower():
-        proto.C = ""
-        proto.C_syn = []
-
+    if not q_en:
+        q_en = norm_text(question)
     return proto, q_en
 
+# =========================================================
+# PubMed query builder
+# =========================================================
 def quote_tiab(term: str) -> str:
     term = term.strip()
     if not term:
@@ -904,17 +903,13 @@ def or_block(items: List[str]) -> str:
 def build_pubmed_query(proto: Protocol, article_type: str, custom_filter: str) -> str:
     # Topic blocks: use synonyms (tiab) + mesh candidates
     def build_axis(text: str, syn: List[str], mesh: List[str]) -> str:
-        tiabs: List[str] = []
-        if (text or "").strip() and not has_cjk(text):
+        tiabs = []
+        if text.strip():
             tiabs.append(quote_tiab(text))
         for s in (syn or []):
-            s = (s or "").strip()
-            if not s or has_cjk(s):
-                continue
-            if (text or "").strip() and s.lower() == (text or "").strip().lower():
-                continue
-            tiabs.append(quote_tiab(s))
-        meshes = [mesh_term(m) for m in (mesh or []) if (m or "").strip()]
+            if s.strip() and s.strip().lower() != text.strip().lower():
+                tiabs.append(quote_tiab(s))
+        meshes = [mesh_term(m) for m in (mesh or []) if m.strip()]
         block = or_block([b for b in (or_block(meshes), or_block(tiabs)) if b])
         return block
 
@@ -925,18 +920,14 @@ def build_pubmed_query(proto: Protocol, article_type: str, custom_filter: str) -
 
     blocks = [b for b in [P_block, I_block, C_block, O_block] if b]
     if not blocks:
-        # last-resort fallback: use English seed; never send CJK text directly to PubMed
-        qseed = norm_text(st.session_state.get("question_en") or "")
-        if not qseed or has_cjk(qseed):
-            qseed = ascii_seed_from_text(st.session_state.get("question") or "")
-        if qseed:
-            blocks = [quote_tiab(qseed)]
-        else:
-            blocks = []
+        q_en = norm_text(st.session_state.get("question_en") or "")
+        q0 = norm_text(st.session_state.get("question") or "")
+        if not q_en and contains_cjk(q0):
+            q_en = extract_english_tokens(q0)
+        # If still empty, do NOT fall back to CJK text; leave empty and let UI prompt user.
+        blocks = [quote_tiab(q_en)] if q_en else []
 
     q = " AND ".join([f"({b})" if " OR " in b else b for b in blocks if b])
-    if not q.strip():
-        return ""
 
     # Article type filter (optional)
     f = ARTICLE_TYPE_FILTERS.get(article_type, "")
@@ -953,6 +944,11 @@ def build_pubmed_query(proto: Protocol, article_type: str, custom_filter: str) -
         q = f"({q}) NOT ({NOT})"
 
     return q
+
+# =========================================================
+# PubMed eUtils
+# =========================================================
+EUTILS = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 
 def esearch(term: str, retstart: int = 0, retmax: int = 200) -> Tuple[List[str], int, str, List[str]]:
     warnings = []
@@ -1557,6 +1553,22 @@ col1, col2 = st.columns([2,1])
 with col1:
     st.markdown(f"**{t('question_notice')}**")
     st.text_input(t("question_label"), key="question", help=t("question_help"))
+
+# English query seed (recommended for PubMed; especially when the question is Chinese)
+q_now = st.session_state.get("question","") or ""
+# auto-fill once per new question if user hasn't edited it
+if st.session_state.get("_question_en_src","") != q_now and not (st.session_state.get("question_en") or "").strip():
+    if contains_cjk(q_now):
+        st.session_state["question_en"] = extract_english_tokens(q_now)
+    else:
+        st.session_state["question_en"] = norm_text(q_now)
+    st.session_state["_question_en_src"] = q_now
+
+with st.expander("English query seed（PubMed 建議用英文；可手動修正）", expanded=contains_cjk(q_now)):
+    st.text_input("English keywords / question", key="question_en",
+                  help="若未啟用 LLM，系統無法可靠翻譯中文；請至少輸入英文關鍵字（例如：diffractive EDOF IOL vs nondiffractive EDOF）。")
+    if contains_cjk(q_now) and not (st.session_state.get("question_en") or "").strip():
+        st.warning("偵測到中文問句但缺少英文關鍵字：PubMed 檢索品質會很差。請在此輸入英文關鍵字，或在側邊欄啟用 LLM（使用者自備 key）做自動翻譯與同義詞/MeSH 擴充。")
 with col2:
     st.markdown("**Run**")
     run_clicked = st.button(t("run"), type="primary")
@@ -1593,15 +1605,12 @@ def run_pipeline():
     # Auto build query
     auto_q = build_pubmed_query(proto, st.session_state.get("article_type","不限"), st.session_state.get("custom_pubmed_filter",""))
     st.session_state["pubmed_query_auto"] = auto_q
+    if not auto_q.strip():
+        st.warning("無法自動產生有效的英文 PubMed 搜尋式：請在首頁的 English query seed 輸入英文關鍵字，或啟用 LLM（使用者自備 key）以自動翻譯與擴充同義詞/MeSH。")
+        return
     # If user hasn't edited manually yet, set pubmed_query to auto
     if not st.session_state.get("pubmed_query"):
         st.session_state["pubmed_query"] = auto_q
-
-    # If query is still empty, stop gracefully (avoid sending non-English text to PubMed)
-    if not (st.session_state.get("pubmed_query") or "").strip():
-        st.session_state["pubmed_records"] = pd.DataFrame()
-        st.session_state["diagnostics"] = {"warnings": ["PubMed query is empty. If your question is non-English, enable BYOK LLM or edit the query in Step 1 using English keywords/MeSH."]}
-        return
 
     # Fetch pubmed
     df, diag = fetch_pubmed(st.session_state["pubmed_query"], max_records=int(st.session_state.get("max_pubmed_records",1000) or 1000), page_size=int(st.session_state.get("pubmed_page_size",200) or 200))
@@ -1832,9 +1841,6 @@ with tabs[1]:
     else:
         with st.expander(t("pico_edit"), expanded=True):
             # Manual PICO correction (core ask)
-            st.caption(t("english_hint"))
-            q_en_in = st.text_input("Question (English seed for PubMed)", value=st.session_state.get("question_en",""), key="edit_question_en")
-
             c1, c2 = st.columns(2)
             with c1:
                 P = st.text_input("P", value=proto.P, key="edit_P")
@@ -1856,8 +1862,6 @@ with tabs[1]:
 
             if st.button(t("pico_apply"), type="primary"):
                 proto.P = norm_text(P); proto.I = norm_text(I_); proto.C = norm_text(C); proto.O = norm_text(O)
-                st.session_state["question_en"] = norm_text(q_en_in)
-
                 proto.NOT = norm_text(NOT)
                 proto.P_syn = [norm_text(x) for x in re.split(r"[,\n]+", P_syn or "") if norm_text(x)]
                 proto.I_syn = [norm_text(x) for x in re.split(r"[,\n]+", I_syn or "") if norm_text(x)]
@@ -1992,6 +1996,67 @@ with tabs[3]:
 
         show_cards = (st.session_state.get("view_mode_step34", "卡片") == "卡片")
 
+        # -----------------------------
+        # Smart handoff (Step 3+4 -> Step 4b Full-text queue)
+        # -----------------------------
+        def ta_final_label(pmid: str) -> str:
+            pmid = str(pmid or "").strip()
+            ov = (st.session_state.get("ta_override", {}) or {}).get(pmid)
+            if ov:
+                return ov
+            return (st.session_state.get("ta_ai", {}) or {}).get(pmid, "Unsure") or "Unsure"
+
+        def _ft_queue_set():
+            q = st.session_state.get("ft_queue", [])
+            if not isinstance(q, list):
+                q = []
+            return set([str(x).strip() for x in q if str(x).strip()])
+
+        def ft_enqueue(pmids):
+            s = _ft_queue_set()
+            for p in pmids:
+                p = str(p or "").strip()
+                if p:
+                    s.add(p)
+            st.session_state["ft_queue"] = sorted(s)
+
+        def ft_clear_queue():
+            st.session_state["ft_queue"] = []
+            st.session_state["ft_focus_idx"] = 0
+
+        qset = _ft_queue_set()
+        qcol1, qcol2, qcol3, qcol4 = st.columns([1.25, 1.35, 0.9, 1.6])
+        with qcol1:
+            if st.button("一鍵：AI=Include → 送進 Full-text queue", key="btn_enqueue_ai_include"):
+                pmids = []
+                for pmid in df["PMID"].astype(str).tolist():
+                    if (st.session_state.get("ta_ai", {}) or {}).get(pmid, "Unsure") == "Include":
+                        pmids.append(pmid)
+                ft_enqueue(pmids)
+                st.success(f"已加入 queue：{len(pmids)} 篇（目前 queue={len(_ft_queue_set())}）")
+        with qcol2:
+            if st.button("一鍵：Final≠Exclude → 送進 Full-text queue", key="btn_enqueue_final_kept"):
+                pmids = []
+                for pmid in df["PMID"].astype(str).tolist():
+                    if ta_final_label(pmid) != "Exclude":
+                        pmids.append(pmid)
+                ft_enqueue(pmids)
+                st.success(f"已加入 queue：{len(pmids)} 篇（目前 queue={len(_ft_queue_set())}）")
+        with qcol3:
+            if st.button("清空 queue", key="btn_clear_ft_queue"):
+                ft_clear_queue()
+                st.info("已清空 Full-text queue。")
+        with qcol4:
+            st.caption(f"Full-text queue：**{len(qset)}** 篇（Step 4b 將優先只顯示 queue）")
+
+        qc1, qc2, qc3 = st.columns([1.2, 1.0, 2.8])
+        with qc1:
+            st.session_state["ta_quick_mode"] = st.checkbox("Unsure 快速覆核（一次一篇）", value=st.session_state.get("ta_quick_mode", False))
+        with qc2:
+            st.session_state["ta_auto_next"] = st.checkbox("Auto-next", value=st.session_state.get("ta_auto_next", True))
+        with qc3:
+            st.caption("提示：快速覆核只帶你看 Unsure；按 Include 會同時加入 Full-text queue（減少人工找全文負擔）。")
+
         if not show_cards:
             view = df[["PMID", "Year", "First_author", "Journal", "Title"]].copy()
             view["AI_suggest"] = [st.session_state.get("ta_ai", {}).get(str(p), "") for p in view["PMID"].astype(str)]
@@ -2000,17 +2065,14 @@ with tabs[3]:
                 for p in view["PMID"].astype(str)
             ]
             st.dataframe(view, use_container_width=True, hide_index=True)
-        else:
-            # 分區顯示：依「AI 建議」自動分成 Include / Unsure / Exclude，方便快速瀏覽
+        else:            # 分區顯示：依「Final 決策（override > AI）」自動分成 Include / Unsure / Exclude，方便快速瀏覽
             groups = {"Include": [], "Unsure": [], "Exclude": []}
             for _, r in df.iterrows():
                 pmid0 = str(r.get("PMID", "") or "").strip()
-                ai0 = (st.session_state.get("ta_ai", {}) or {}).get(pmid0, "Unsure") or "Unsure"
-                if ai0 not in groups:
-                    ai0 = "Unsure"
-                groups[ai0].append(r)
-
-
+                lbl0 = ta_final_label(pmid0)
+                if lbl0 not in groups:
+                    lbl0 = "Unsure"
+                groups[lbl0].append(r)
             def badge_html(label: str) -> str:
                 """Small colored badge used in Step 3+4 grouping."""
                 label = (label or "").strip()
@@ -2103,9 +2165,54 @@ with tabs[3]:
                         height=85,
                     )
 
+
                     st.markdown("</div>", unsafe_allow_html=True)
 
-            # Render by groups (AI suggestion)
+            if st.session_state.get("ta_quick_mode", False):
+                unsure_items = groups.get("Unsure", [])
+                if unsure_items:
+                    idx = int(st.session_state.get("ta_focus_idx", 0) or 0)
+                    idx = max(0, min(idx, len(unsure_items) - 1))
+                    st.session_state["ta_focus_idx"] = idx
+                    r0 = unsure_items[idx]
+                    pmid0 = str(r0.get("PMID", "") or "").strip()
+
+                    st.markdown(f"### Unsure 快速覆核（{idx+1}/{len(unsure_items)}）")
+                    b1, b2, b3, b4 = st.columns([1.0, 1.2, 1.0, 1.2])
+                    with b1:
+                        if st.button("← 上一篇", key=f"ta_quick_prev_{pmid0}") and idx > 0:
+                            st.session_state["ta_focus_idx"] = idx - 1
+                            st.rerun()
+                    with b2:
+                        if st.button("Include → queue", key=f"ta_quick_inc_{pmid0}"):
+                            st.session_state.setdefault("ta_override", {})
+                            st.session_state.setdefault("ta_override_reason", {})
+                            st.session_state["ta_override"][pmid0] = "Include"
+                            st.session_state["ta_override_reason"][pmid0] = "Quick-review: keep for full text."
+                            ft_enqueue([pmid0])
+                            if st.session_state.get("ta_auto_next", True) and idx < len(unsure_items) - 1:
+                                st.session_state["ta_focus_idx"] = idx + 1
+                            st.rerun()
+                    with b3:
+                        if st.button("Exclude", key=f"ta_quick_exc_{pmid0}"):
+                            st.session_state.setdefault("ta_override", {})
+                            st.session_state.setdefault("ta_override_reason", {})
+                            st.session_state["ta_override"][pmid0] = "Exclude"
+                            st.session_state["ta_override_reason"][pmid0] = "Quick-review: exclude at title/abstract."
+                            if st.session_state.get("ta_auto_next", True) and idx < len(unsure_items) - 1:
+                                st.session_state["ta_focus_idx"] = idx + 1
+                            st.rerun()
+                    with b4:
+                        if st.button("下一篇 →", key=f"ta_quick_next_{pmid0}") and idx < len(unsure_items) - 1:
+                            st.session_state["ta_focus_idx"] = idx + 1
+                            st.rerun()
+
+                    render_record_card(r0)
+                    st.divider()
+                else:
+                    st.success("目前沒有 Unsure 需要快速覆核。")
+
+# Render by groups (AI suggestion)
             for lbl in ["Include", "Unsure", "Exclude"]:
                 items = groups.get(lbl, [])
                 st.markdown(f"### {badge_html(lbl)} {lbl}（{len(items)}）", unsafe_allow_html=True)
@@ -2139,13 +2246,40 @@ with tabs[4]:
         def final_ta(pmid: str) -> str:
             return st.session_state.get("ta_override",{}).get(pmid) or st.session_state.get("ta_ai",{}).get(pmid,"Unsure")
 
-        kept = df[df["PMID"].astype(str).apply(lambda x: final_ta(str(x)) != "Exclude")].copy()
-        st.caption(f"進入全文階段的 records（Title/Abstract 未排除）：{kept.shape[0]} 篇")
+        # Priority: if Full-text queue is non-empty, Step 4b shows ONLY the queue (lowest effort)
+        q = st.session_state.get("ft_queue", [])
+        qset = set([str(x).strip() for x in q if str(x).strip()]) if isinstance(q, list) else set()
+
+        if len(qset) > 0:
+            kept = df[df["PMID"].astype(str).isin(qset)].copy()
+            st.caption(f"Full-text queue 模式：{kept.shape[0]} 篇（Step 4b 僅顯示 queue）")
+        else:
+            kept = df[df["PMID"].astype(str).apply(lambda x: final_ta(str(x)) != "Exclude")].copy()
+            st.caption(f"進入全文階段的 records（Title/Abstract 未排除）：{kept.shape[0]} 篇")
 
         if kept.empty:
             st.info("沒有可做全文審查的 record。")
         else:
+            # Review controls (reduce effort)
+            cft1, cft2, cft3 = st.columns([1.35, 1.15, 2.5])
+            with cft1:
+                st.session_state["ft_only_pending"] = st.checkbox("只顯示待處理（Not reviewed）", value=st.session_state.get("ft_only_pending", True), key="ft_only_pending_ctl")
+            with cft2:
+                st.session_state["ft_quick_mode"] = st.checkbox("快速審查（一次一篇）", value=st.session_state.get("ft_quick_mode", True), key="ft_quick_mode_ctl")
+            with cft3:
+                st.session_state["ft_auto_next"] = st.checkbox("Auto-next", value=st.session_state.get("ft_auto_next", True), key="ft_auto_next_ctl")
+
+            # Apply filters
+            if st.session_state.get("ft_only_pending", True):
+                kept = kept[kept["PMID"].astype(str).apply(lambda p: st.session_state.get("ft_decision", {}).get(str(p), "Not reviewed") == "Not reviewed")].copy()
+
+            kept = kept.reset_index(drop=True)
+            if kept.empty:
+                st.info("目前沒有待處理的全文審查項目。")
+                st.stop()
+
             # Bulk upload PDFs
+
             st.markdown("#### " + t("ft_bulk_upload"))
             st.caption("注意：若為校內訂閱/付費期刊全文，請勿上傳到雲端部署（授權風險）。建議只上傳 OA/PMC 或本機版使用。")
             uploads = st.file_uploader("Upload PDFs (multiple)", type=["pdf"], accept_multiple_files=True)
@@ -2162,10 +2296,34 @@ with tabs[4]:
             st.markdown("---")
             st.markdown("#### Full-text decisions (per record)")
 
-            for _, r in kept.iterrows():
+            # Quick mode: render one-by-one; otherwise render all
+            if st.session_state.get("ft_quick_mode", True):
+                idx = int(st.session_state.get("ft_focus_idx", 0) or 0)
+                idx = max(0, min(idx, len(kept) - 1))
+                st.session_state["ft_focus_idx"] = idx
+
+                st.markdown(f"#### Full-text 快速審查（{idx+1}/{len(kept)}）")
+                nav1, nav2, nav3 = st.columns([1.0, 1.0, 3.0])
+                with nav1:
+                    if st.button("← 上一篇", key="ft_nav_prev") and idx > 0:
+                        st.session_state["ft_focus_idx"] = idx - 1
+                        st.rerun()
+                with nav2:
+                    if st.button("下一篇 →", key="ft_nav_next") and idx < len(kept) - 1:
+                        st.session_state["ft_focus_idx"] = idx + 1
+                        st.rerun()
+                with nav3:
+                    st.caption("做出 Include/Exclude 後（若勾選 Auto-next）會自動跳下一篇。")
+
+                rows_iter = [kept.iloc[idx]]
+            else:
+                rows_iter = [kept.iloc[i] for i in range(len(kept))]
+
+            for r in rows_iter:
                 pmid = str(r["PMID"])
                 title = r["Title"]; year = r["Year"]; fa = r["First_author"]; journal = r["Journal"]; doi = r["DOI"]
                 decision = st.session_state["ft_decision"].get(pmid, "Not reviewed")
+                prev_decision = (st.session_state.get("ft_decision_prev", {}) or {}).get(pmid, decision)
                 reason = st.session_state["ft_reason"].get(pmid, "")
 
                 with st.container():
