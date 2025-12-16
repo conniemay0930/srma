@@ -494,6 +494,18 @@ def init_state():
     ss.setdefault("ft_pdf", {})        # pmid -> bytes
     ss.setdefault("ft_text", {})       # pmid -> str (extracted or pasted)
 
+    # Full-text work queue + quick-review states (smart handoff)
+    ss.setdefault("ft_queue", [])              # list[str] pmid; Step 4b will prefer only this list when non-empty
+    ss.setdefault("ft_only_pending", True)     # Step 4b: show only Not reviewed by default
+    ss.setdefault("ft_quick_mode", True)       # Step 4b: one-by-one review mode
+    ss.setdefault("ft_auto_next", True)        # Step 4b: auto move to next after decision
+    ss.setdefault("ft_focus_idx", 0)           # Step 4b: current index in queue
+    ss.setdefault("ft_decision_prev", {})      # pmid -> last decision (for change detection)
+
+    ss.setdefault("ta_quick_mode", False)      # Step 3+4: quick review Unsure one-by-one
+    ss.setdefault("ta_auto_next", True)
+    ss.setdefault("ta_focus_idx", 0)
+
     # extraction
     ss.setdefault("extract_schema_text", "")
     ss.setdefault("extract_df", pd.DataFrame())
@@ -1853,6 +1865,67 @@ with tabs[3]:
 
         show_cards = (st.session_state.get("view_mode_step34", "卡片") == "卡片")
 
+        # -----------------------------
+        # Smart handoff (Step 3+4 -> Step 4b Full-text queue)
+        # -----------------------------
+        def ta_final_label(pmid: str) -> str:
+            pmid = str(pmid or "").strip()
+            ov = (st.session_state.get("ta_override", {}) or {}).get(pmid)
+            if ov:
+                return ov
+            return (st.session_state.get("ta_ai", {}) or {}).get(pmid, "Unsure") or "Unsure"
+
+        def _ft_queue_set():
+            q = st.session_state.get("ft_queue", [])
+            if not isinstance(q, list):
+                q = []
+            return set([str(x).strip() for x in q if str(x).strip()])
+
+        def ft_enqueue(pmids):
+            s = _ft_queue_set()
+            for p in pmids:
+                p = str(p or "").strip()
+                if p:
+                    s.add(p)
+            st.session_state["ft_queue"] = sorted(s)
+
+        def ft_clear_queue():
+            st.session_state["ft_queue"] = []
+            st.session_state["ft_focus_idx"] = 0
+
+        qset = _ft_queue_set()
+        qcol1, qcol2, qcol3, qcol4 = st.columns([1.25, 1.35, 0.9, 1.6])
+        with qcol1:
+            if st.button("一鍵：AI=Include → 送進 Full-text queue", key="btn_enqueue_ai_include"):
+                pmids = []
+                for pmid in df["PMID"].astype(str).tolist():
+                    if (st.session_state.get("ta_ai", {}) or {}).get(pmid, "Unsure") == "Include":
+                        pmids.append(pmid)
+                ft_enqueue(pmids)
+                st.success(f"已加入 queue：{len(pmids)} 篇（目前 queue={len(_ft_queue_set())}）")
+        with qcol2:
+            if st.button("一鍵：Final≠Exclude → 送進 Full-text queue", key="btn_enqueue_final_kept"):
+                pmids = []
+                for pmid in df["PMID"].astype(str).tolist():
+                    if ta_final_label(pmid) != "Exclude":
+                        pmids.append(pmid)
+                ft_enqueue(pmids)
+                st.success(f"已加入 queue：{len(pmids)} 篇（目前 queue={len(_ft_queue_set())}）")
+        with qcol3:
+            if st.button("清空 queue", key="btn_clear_ft_queue"):
+                ft_clear_queue()
+                st.info("已清空 Full-text queue。")
+        with qcol4:
+            st.caption(f"Full-text queue：**{len(qset)}** 篇（Step 4b 將優先只顯示 queue）")
+
+        qc1, qc2, qc3 = st.columns([1.2, 1.0, 2.8])
+        with qc1:
+            st.session_state["ta_quick_mode"] = st.checkbox("Unsure 快速覆核（一次一篇）", value=st.session_state.get("ta_quick_mode", False))
+        with qc2:
+            st.session_state["ta_auto_next"] = st.checkbox("Auto-next", value=st.session_state.get("ta_auto_next", True))
+        with qc3:
+            st.caption("提示：快速覆核只帶你看 Unsure；按 Include 會同時加入 Full-text queue（減少人工找全文負擔）。")
+
         if not show_cards:
             view = df[["PMID", "Year", "First_author", "Journal", "Title"]].copy()
             view["AI_suggest"] = [st.session_state.get("ta_ai", {}).get(str(p), "") for p in view["PMID"].astype(str)]
@@ -1861,17 +1934,14 @@ with tabs[3]:
                 for p in view["PMID"].astype(str)
             ]
             st.dataframe(view, use_container_width=True, hide_index=True)
-        else:
-            # 分區顯示：依「AI 建議」自動分成 Include / Unsure / Exclude，方便快速瀏覽
+        else:            # 分區顯示：依「Final 決策（override > AI）」自動分成 Include / Unsure / Exclude，方便快速瀏覽
             groups = {"Include": [], "Unsure": [], "Exclude": []}
             for _, r in df.iterrows():
                 pmid0 = str(r.get("PMID", "") or "").strip()
-                ai0 = (st.session_state.get("ta_ai", {}) or {}).get(pmid0, "Unsure") or "Unsure"
-                if ai0 not in groups:
-                    ai0 = "Unsure"
-                groups[ai0].append(r)
-
-
+                lbl0 = ta_final_label(pmid0)
+                if lbl0 not in groups:
+                    lbl0 = "Unsure"
+                groups[lbl0].append(r)
             def badge_html(label: str) -> str:
                 """Small colored badge used in Step 3+4 grouping."""
                 label = (label or "").strip()
@@ -1964,9 +2034,63 @@ with tabs[3]:
                         height=85,
                     )
 
+                    # Auto-next hook (only in quick mode)
+                    st.session_state.setdefault("ft_decision_prev", {})
+                    st.session_state["ft_decision_prev"][pmid] = decision_new
+                    if st.session_state.get("ft_quick_mode", True) and st.session_state.get("ft_auto_next", True):
+                        if prev_decision == "Not reviewed" and decision_new in ["Include for meta-analysis", "Exclude"]:
+                            if int(st.session_state.get("ft_focus_idx", 0) or 0) < max(len(kept) - 1, 0):
+                                st.session_state["ft_focus_idx"] = int(st.session_state.get("ft_focus_idx", 0) or 0) + 1
+                            st.rerun()
+
                     st.markdown("</div>", unsafe_allow_html=True)
 
-            # Render by groups (AI suggestion)
+                        # Optional: Unsure quick-review (one-by-one) to reduce effort
+            if st.session_state.get("ta_quick_mode", False):
+                unsure_items = groups.get("Unsure", [])
+                if unsure_items:
+                    idx = int(st.session_state.get("ta_focus_idx", 0) or 0)
+                    idx = max(0, min(idx, len(unsure_items) - 1))
+                    st.session_state["ta_focus_idx"] = idx
+                    r0 = unsure_items[idx]
+                    pmid0 = str(r0.get("PMID", "") or "").strip()
+
+                    st.markdown(f"### Unsure 快速覆核（{idx+1}/{len(unsure_items)}）")
+                    b1, b2, b3, b4 = st.columns([1.0, 1.2, 1.0, 1.2])
+                    with b1:
+                        if st.button("← 上一篇", key=f"ta_quick_prev_{pmid0}") and idx > 0:
+                            st.session_state["ta_focus_idx"] = idx - 1
+                            st.rerun()
+                    with b2:
+                        if st.button("Include → queue", key=f"ta_quick_inc_{pmid0}"):
+                            st.session_state.setdefault("ta_override", {})
+                            st.session_state.setdefault("ta_override_reason", {})
+                            st.session_state["ta_override"][pmid0] = "Include"
+                            st.session_state["ta_override_reason"][pmid0] = "Quick-review: keep for full text."
+                            ft_enqueue([pmid0])
+                            if st.session_state.get("ta_auto_next", True) and idx < len(unsure_items) - 1:
+                                st.session_state["ta_focus_idx"] = idx + 1
+                            st.rerun()
+                    with b3:
+                        if st.button("Exclude", key=f"ta_quick_exc_{pmid0}"):
+                            st.session_state.setdefault("ta_override", {})
+                            st.session_state.setdefault("ta_override_reason", {})
+                            st.session_state["ta_override"][pmid0] = "Exclude"
+                            st.session_state["ta_override_reason"][pmid0] = "Quick-review: exclude at title/abstract."
+                            if st.session_state.get("ta_auto_next", True) and idx < len(unsure_items) - 1:
+                                st.session_state["ta_focus_idx"] = idx + 1
+                            st.rerun()
+                    with b4:
+                        if st.button("下一篇 →", key=f"ta_quick_next_{pmid0}") and idx < len(unsure_items) - 1:
+                            st.session_state["ta_focus_idx"] = idx + 1
+                            st.rerun()
+
+                    render_record_card(r0)
+                    st.divider()
+                else:
+                    st.success("目前沒有 Unsure 需要快速覆核。")
+
+# Render by groups (AI suggestion)
             for lbl in ["Include", "Unsure", "Exclude"]:
                 items = groups.get(lbl, [])
                 st.markdown(f"### {badge_html(lbl)} {lbl}（{len(items)}）", unsafe_allow_html=True)
@@ -2000,13 +2124,40 @@ with tabs[4]:
         def final_ta(pmid: str) -> str:
             return st.session_state.get("ta_override",{}).get(pmid) or st.session_state.get("ta_ai",{}).get(pmid,"Unsure")
 
-        kept = df[df["PMID"].astype(str).apply(lambda x: final_ta(str(x)) != "Exclude")].copy()
-        st.caption(f"進入全文階段的 records（Title/Abstract 未排除）：{kept.shape[0]} 篇")
+        # Priority: if Full-text queue is non-empty, Step 4b shows ONLY the queue (lowest effort)
+        q = st.session_state.get("ft_queue", [])
+        qset = set([str(x).strip() for x in q if str(x).strip()]) if isinstance(q, list) else set()
+
+        if len(qset) > 0:
+            kept = df[df["PMID"].astype(str).isin(qset)].copy()
+            st.caption(f"Full-text queue 模式：{kept.shape[0]} 篇（Step 4b 僅顯示 queue）")
+        else:
+            kept = df[df["PMID"].astype(str).apply(lambda x: final_ta(str(x)) != "Exclude")].copy()
+            st.caption(f"進入全文階段的 records（Title/Abstract 未排除）：{kept.shape[0]} 篇")
 
         if kept.empty:
             st.info("沒有可做全文審查的 record。")
         else:
+            # Review controls (reduce effort)
+            cft1, cft2, cft3 = st.columns([1.35, 1.15, 2.5])
+            with cft1:
+                st.session_state["ft_only_pending"] = st.checkbox("只顯示待處理（Not reviewed）", value=st.session_state.get("ft_only_pending", True), key="ft_only_pending_ctl")
+            with cft2:
+                st.session_state["ft_quick_mode"] = st.checkbox("快速審查（一次一篇）", value=st.session_state.get("ft_quick_mode", True), key="ft_quick_mode_ctl")
+            with cft3:
+                st.session_state["ft_auto_next"] = st.checkbox("Auto-next", value=st.session_state.get("ft_auto_next", True), key="ft_auto_next_ctl")
+
+            # Apply filters
+            if st.session_state.get("ft_only_pending", True):
+                kept = kept[kept["PMID"].astype(str).apply(lambda p: st.session_state.get("ft_decision", {}).get(str(p), "Not reviewed") == "Not reviewed")].copy()
+
+            kept = kept.reset_index(drop=True)
+            if kept.empty:
+                st.info("目前沒有待處理的全文審查項目。")
+                st.stop()
+
             # Bulk upload PDFs
+
             st.markdown("#### " + t("ft_bulk_upload"))
             st.caption("注意：若為校內訂閱/付費期刊全文，請勿上傳到雲端部署（授權風險）。建議只上傳 OA/PMC 或本機版使用。")
             uploads = st.file_uploader("Upload PDFs (multiple)", type=["pdf"], accept_multiple_files=True)
@@ -2023,10 +2174,34 @@ with tabs[4]:
             st.markdown("---")
             st.markdown("#### Full-text decisions (per record)")
 
-            for _, r in kept.iterrows():
+            # Quick mode: render one-by-one; otherwise render all
+            if st.session_state.get("ft_quick_mode", True):
+                idx = int(st.session_state.get("ft_focus_idx", 0) or 0)
+                idx = max(0, min(idx, len(kept) - 1))
+                st.session_state["ft_focus_idx"] = idx
+
+                st.markdown(f"#### Full-text 快速審查（{idx+1}/{len(kept)}）")
+                nav1, nav2, nav3 = st.columns([1.0, 1.0, 3.0])
+                with nav1:
+                    if st.button("← 上一篇", key="ft_nav_prev") and idx > 0:
+                        st.session_state["ft_focus_idx"] = idx - 1
+                        st.rerun()
+                with nav2:
+                    if st.button("下一篇 →", key="ft_nav_next") and idx < len(kept) - 1:
+                        st.session_state["ft_focus_idx"] = idx + 1
+                        st.rerun()
+                with nav3:
+                    st.caption("做出 Include/Exclude 後（若勾選 Auto-next）會自動跳下一篇。")
+
+                rows_iter = [kept.iloc[idx]]
+            else:
+                rows_iter = [kept.iloc[i] for i in range(len(kept))]
+
+            for r in rows_iter:
                 pmid = str(r["PMID"])
                 title = r["Title"]; year = r["Year"]; fa = r["First_author"]; journal = r["Journal"]; doi = r["DOI"]
                 decision = st.session_state["ft_decision"].get(pmid, "Not reviewed")
+                prev_decision = (st.session_state.get("ft_decision_prev", {}) or {}).get(pmid, decision)
                 reason = st.session_state["ft_reason"].get(pmid, "")
 
                 with st.container():
