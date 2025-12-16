@@ -2034,18 +2034,9 @@ with tabs[3]:
                         height=85,
                     )
 
-                    # Auto-next hook (only in quick mode)
-                    st.session_state.setdefault("ft_decision_prev", {})
-                    st.session_state["ft_decision_prev"][pmid] = decision_new
-                    if st.session_state.get("ft_quick_mode", True) and st.session_state.get("ft_auto_next", True):
-                        if prev_decision == "Not reviewed" and decision_new in ["Include for meta-analysis", "Exclude"]:
-                            if int(st.session_state.get("ft_focus_idx", 0) or 0) < max(len(kept) - 1, 0):
-                                st.session_state["ft_focus_idx"] = int(st.session_state.get("ft_focus_idx", 0) or 0) + 1
-                            st.rerun()
 
                     st.markdown("</div>", unsafe_allow_html=True)
 
-                        # Optional: Unsure quick-review (one-by-one) to reduce effort
             if st.session_state.get("ta_quick_mode", False):
                 unsure_items = groups.get("Unsure", [])
                 if unsure_items:
