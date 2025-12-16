@@ -1900,8 +1900,60 @@ with tabs[1]:
         st.code(pretty_json(proto.to_dict()), language="json")
 
         st.markdown("### " + t("pubmed_edit"))
+
+        # Callbacks: avoid StreamlitAPIException when updating a widget key after instantiation
+        def _set_pubmed_notice(level: str, msg: str):
+            st.session_state["_pubmed_notice"] = {"level": level, "msg": msg}
+
+        def cb_restore_pubmed_query():
+            st.session_state["pubmed_query"] = st.session_state.get("pubmed_query_auto", "")
+            _set_pubmed_notice("info", "已還原為自動生成的 PubMed 搜尋式（可再手改）。")
+
+        def cb_auto_english_query():
+            proto: Protocol = st.session_state.get("protocol")
+            question = st.session_state.get("question", "")
+            art = st.session_state.get("article_type", "不限")
+            custom_f = st.session_state.get("custom_pubmed_filter", "")
+            not_clause = getattr(proto, "NOT", "") if proto else ""
+
+            if llm_available():
+                try:
+                    q_llm = llm_generate_pubmed_query_from_proto(question, proto, art, custom_f)
+                    if not q_llm:
+                        raise RuntimeError("Empty LLM output")
+                    st.session_state["pubmed_query_auto"] = q_llm
+                    st.session_state["pubmed_query"] = q_llm
+                    _set_pubmed_notice("success", "已用 LLM 產生英文 PubMed 搜尋式（可再手改）。")
+                    return
+                except Exception:
+                    pass
+
+            q_rb = rule_based_pubmed_query_from_question(question, art, custom_f, not_clause)
+            st.session_state["pubmed_query_auto"] = q_rb
+            st.session_state["pubmed_query"] = q_rb
+            if llm_available():
+                _set_pubmed_notice("warning", "LLM 產生失敗，已改用規則式英文搜尋式（建議手動微調）。")
+            else:
+                _set_pubmed_notice("info", "未啟用 LLM：已用規則式產生英文搜尋式（建議手動補同義詞）。")
+
         st.text_area("", key="pubmed_query", height=120)
-        cA, cB, cC, cD = st.columns([1,1,1,2])
+
+        # show any notice from callbacks
+        notice = st.session_state.pop("_pubmed_notice", None)
+        if isinstance(notice, dict):
+            lvl = notice.get("level", "info")
+            msg = notice.get("msg", "")
+            if msg:
+                if lvl == "success":
+                    st.success(msg)
+                elif lvl == "warning":
+                    st.warning(msg)
+                elif lvl == "error":
+                    st.error(msg)
+                else:
+                    st.info(msg)
+
+        cA, cB, cC, cD = st.columns([1, 1, 1, 2])
         with cA:
             if st.button(t("pubmed_refetch"), type="primary"):
                 refetch_pubmed_and_sync()
@@ -1910,33 +1962,9 @@ with tabs[1]:
                 st.success(f"抓到 {df.shape[0]} 篇（PubMed count={diag.get('pubmed_total_count',0)}）。")
                 st.info("已使用手動 PubMed query 重新抓取並同步後續步驟；若先前已有人工標記/抽取，系統僅保留仍存在於目前 records 的部分。")
         with cB:
-            if st.button(t("pubmed_restore")):
-                st.session_state["pubmed_query"] = st.session_state.get("pubmed_query_auto","")
+            st.button(t("pubmed_restore"), on_click=cb_restore_pubmed_query)
         with cC:
-            if st.button("自動轉英文搜尋式", help="優先使用 BYOK LLM；未啟用時改用規則式關鍵字。"):
-                proto: Protocol = st.session_state.get("protocol")
-                question = st.session_state.get("question","")
-                art = st.session_state.get("article_type","不限")
-                custom_f = st.session_state.get("custom_pubmed_filter","")
-                if llm_available():
-                    try:
-                        q_llm = llm_generate_pubmed_query_from_proto(question, proto, art, custom_f)
-                        if q_llm:
-                            st.session_state["pubmed_query_auto"] = q_llm
-                            st.session_state["pubmed_query"] = q_llm
-                            st.success("已用 LLM 產生英文 PubMed 搜尋式（可再手改）。")
-                        else:
-                            raise RuntimeError("Empty LLM output")
-                    except Exception as e:
-                        q_rb = rule_based_pubmed_query_from_question(question, art, custom_f, proto.NOT)
-                        st.session_state["pubmed_query_auto"] = q_rb
-                        st.session_state["pubmed_query"] = q_rb
-                        st.warning("LLM 產生失敗，已改用規則式英文搜尋式（建議手動微調）。")
-                else:
-                    q_rb = rule_based_pubmed_query_from_question(question, art, custom_f, proto.NOT)
-                    st.session_state["pubmed_query_auto"] = q_rb
-                    st.session_state["pubmed_query"] = q_rb
-                    st.info("未啟用 LLM：已用規則式產生英文搜尋式（建議手動補同義詞）。")
+            st.button("自動轉英文搜尋式", help="優先使用 BYOK LLM；未啟用時改用規則式關鍵字。", on_click=cb_auto_english_query)
         with cD:
             st.download_button(
                 t("download_query"),
