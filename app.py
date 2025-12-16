@@ -456,9 +456,6 @@ def init_state():
     ss.setdefault("byok_model", "gpt-4o-mini")
     ss.setdefault("byok_temp", 0.2)
     ss.setdefault("byok_consent", False)
-    ss.setdefault("byok_provider", "自訂/相容API")
-    ss.setdefault("byok_model_choice", "")
-    ss.setdefault("byok_model_custom", "")
 
     # links
     ss.setdefault("RESOLVER_BASE", "")
@@ -558,6 +555,60 @@ def llm_json(system: str, user: str, max_tokens: int = 1200) -> Optional[dict]:
         return None
 
 # =========================================================
+# Provider presets (OpenAI-compatible)
+# =========================================================
+PROVIDER_PRESETS = {
+    # Official OpenAI API
+    "OpenAI": {
+        "base_url": "https://api.openai.com/v1",
+        "models": [
+            "gpt-4o-mini",
+            "gpt-4o",
+            "gpt-4.1-mini",
+            "gpt-4.1",
+            "o4-mini",
+        ],
+    },
+    # OpenRouter (aggregator; requires OpenRouter key)
+    "OpenRouter": {
+        "base_url": "https://openrouter.ai/api/v1",
+        "models": [
+            "openai/gpt-4o-mini",
+            "openai/gpt-4o",
+            "anthropic/claude-3.5-sonnet",
+            "google/gemini-1.5-pro",
+            "meta-llama/llama-3.1-70b-instruct",
+        ],
+    },
+    # Groq (fast; requires Groq key)
+    "Groq": {
+        "base_url": "https://api.groq.com/openai/v1",
+        "models": [
+            "llama-3.1-70b-versatile",
+            "llama-3.1-8b-instant",
+            "mixtral-8x7b-32768",
+            "gemma2-9b-it",
+        ],
+    },
+    # Local Ollama server (no external key; model names depend on what users pulled locally)
+    "Ollama（本機）": {
+        "base_url": "http://localhost:11434/v1",
+        "models": [
+            "llama3.1",
+            "qwen2.5",
+            "mistral",
+        ],
+    },
+}
+
+def _provider_model_options(provider_name: str) -> List[str]:
+    if provider_name in PROVIDER_PRESETS:
+        opts = PROVIDER_PRESETS[provider_name].get("models", []) or []
+        # Always allow custom
+        return list(opts) + ["（自訂）"]
+    return ["（自訂）"]
+
+# =========================================================
 # Sidebar
 # =========================================================
 with st.sidebar:
@@ -591,74 +642,33 @@ with st.sidebar:
     st.checkbox(t("byok_toggle"), key="byok_enabled")
     st.caption(t("byok_notice"))
     st.session_state["byok_consent"] = st.checkbox(t("byok_consent"), value=bool(st.session_state.get("byok_consent", False)))
-    # Provider / Model（下拉，仍保留可自訂）
-    _provider_options = ["自訂/相容API", "OpenAI", "OpenRouter", "Groq", "Ollama(本機)"]
-    st.selectbox(
-        "AI Provider（可選）",
-        options=_provider_options,
-        key="byok_provider",
-        help="可用於快速帶入常見 Base URL 與模型清單；若你用的是其他 OpenAI-compatible API（例如私有部署），選『自訂/相容API』即可。",
-    )
+    # Provider / Base URL / Model
+provider = st.selectbox("Provider", options=list(PROVIDER_PRESETS.keys()) + ["自訂/相容API"], key="byok_provider")
+if provider != "自訂/相容API":
+    st.caption(f"預設 Base URL：{PROVIDER_PRESETS[provider]['base_url']}")
+    c_apply, c_spacer = st.columns([1.3, 2.7])
+    with c_apply:
+        if st.button("套用預設 Base URL", key="byok_apply_base"):
+            st.session_state["byok_base_url"] = PROVIDER_PRESETS[provider]["base_url"]
+    with c_spacer:
+        st.write("")
+st.text_input("Base URL (OpenAI-compatible)", key="byok_base_url", help="例如 https://api.openai.com/v1 或你的相容端點（OpenRouter/Groq/Ollama/vLLM/LM Studio 等）")
 
-    _base_presets = {
-        "OpenAI": "https://api.openai.com/v1",
-        "OpenRouter": "https://openrouter.ai/api/v1",
-        "Groq": "https://api.groq.com/openai/v1",
-        "Ollama(本機)": "http://localhost:11434/v1",
-    }
+model_opts = _provider_model_options(provider) if provider != "自訂/相容API" else ["（自訂）"]
+# Use a separate widget key so we can safely map into byok_model
+current_model = (st.session_state.get("byok_model") or "").strip()
+default_idx = 0
+if current_model and current_model in model_opts:
+    default_idx = model_opts.index(current_model)
+elif "（自訂）" in model_opts:
+    default_idx = model_opts.index("（自訂）")
 
-    cA, cB = st.columns([2, 1])
-    with cA:
-        st.text_input("Base URL (OpenAI-compatible)", key="byok_base_url")
-    with cB:
-        if st.button("套用預設", use_container_width=True):
-            prov = st.session_state.get("byok_provider", "自訂/相容API")
-            if prov in _base_presets:
-                st.session_state["byok_base_url"] = _base_presets[prov]
-
-    _model_presets = {
-        "OpenAI": ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini", "gpt-4.1", "o4-mini", "o3-mini"],
-        "OpenRouter": [
-            "openai/gpt-4o-mini",
-            "openai/gpt-4o",
-            "anthropic/claude-3.5-sonnet",
-            "google/gemini-2.0-flash",
-            "meta-llama/llama-3.1-70b-instruct",
-        ],
-        "Groq": ["llama-3.1-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768", "gemma2-9b-it"],
-        "Ollama(本機)": ["llama3.2", "qwen2.5", "mistral", "phi3.5"],
-        "自訂/相容API": ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini", "gpt-4.1", "o4-mini", "o3-mini"],
-    }
-
-    _prov = st.session_state.get("byok_provider", "自訂/相容API")
-    _choices = list(_model_presets.get(_prov, _model_presets["自訂/相容API"])) + ["自訂…"]
-    _current_model = (st.session_state.get("byok_model") or "").strip()
-
-    if _current_model in _choices:
-        _default_choice = _current_model
-    elif _current_model:
-        _default_choice = "自訂…"
-    else:
-        _default_choice = _choices[0]
-    _default_index = _choices.index(_default_choice) if _default_choice in _choices else 0
-
-    _sel = st.selectbox(
-        "Model（下拉）",
-        options=_choices,
-        index=_default_index,
-        key="byok_model_choice",
-        help="若你的 provider 需要不同 model id（例如 OpenRouter 的 openai/...），可直接選或改成自訂。",
-    )
-    if _sel == "自訂…":
-        st.text_input(
-            "自訂 Model ID",
-            value=_current_model if (_current_model not in _choices) else "",
-            key="byok_model_custom",
-            help="填 provider 的 model id（依 Base URL 服務而定）。",
-        )
-        st.session_state["byok_model"] = (st.session_state.get("byok_model_custom") or "").strip()
-    else:
-        st.session_state["byok_model"] = _sel
+selected_model = st.selectbox("Model（下拉可選；也可自訂）", options=model_opts, index=default_idx, key="byok_model_dropdown")
+if selected_model == "（自訂）":
+    st.text_input("自訂 Model ID", key="byok_model", help="填完整 model id（依你選的 Provider/端點而定）。")
+else:
+    # sync dropdown selection into byok_model
+    st.session_state["byok_model"] = selected_model
 
     st.text_input("API Key", type="password", key="byok_key")
     st.slider("Temperature", 0.0, 1.0, float(st.session_state.get("byok_temp",0.2)), 0.05, key="byok_temp")
@@ -704,50 +714,6 @@ ARTICLE_TYPE_FILTERS = {
 def has_cjk(s: str) -> bool:
     return bool(re.search(r"[\u4e00-\u9fff]", s or ""))
 
-def ascii_seed_from_text(s: str) -> str:
-    """Extract an English/ASCII seed from a possibly non-English question.
-    This is a safe fallback when LLM is disabled.
-    """
-    s = norm_text(s)
-    if not s:
-        return ""
-    if not has_cjk(s):
-        return s
-    # keep latin words/numbers and common separators
-    toks = re.findall(r"[A-Za-z0-9][A-Za-z0-9\-\+\/\.]{1,}", s)
-    # expand common abbreviations
-    expanded: List[str] = []
-    for t0 in toks:
-        expanded.append(t0)
-        tu = t0.upper()
-        if tu in ABBR_MAP:
-            expanded.extend(ABBR_MAP[tu])
-    # dedup while keeping order
-    out: List[str] = []
-    seen: set = set()
-    for x in expanded:
-        k = x.lower().strip()
-        if k and k not in seen:
-            seen.add(k)
-            out.append(x)
-    return " ".join(out).strip()
-
-def auto_question_en(question: str) -> str:
-    """Best-effort English version of the research question.
-
-    Priority:
-    - If already English (no CJK), return as-is
-    - Else, extract ASCII seed + expand abbreviations
-    """
-    q = norm_text(question)
-    if not q:
-        return ""
-    if not has_cjk(q):
-        return q
-    return ascii_seed_from_text(q)
-
-
-
 def split_vs(question: str) -> Tuple[str, str]:
     q = question or ""
     m = re.split(r"\s+vs\.?\s+|\s+VS\.?\s+|\s+versus\s+| vs | VS ", q, flags=re.IGNORECASE)
@@ -789,58 +755,19 @@ def expand_terms(text: str) -> List[str]:
     return out
 
 def propose_mesh_candidates(terms: List[str]) -> List[str]:
-    """Heuristic MeSH candidate proposer.
-
-    Design goals:
-    - Never raise errors (safe offline / blocked environments)
-    - Provide reasonable default MeSH headings for common ophthalmology & lens topics
-    - Keep lists short and deduplicated
-    """
-    mesh: List[str] = []
-    for t0 in (terms or []):
-        tl = (t0 or "").lower()
-
-        # Cataract / lens surgery
+    mesh = []
+    for t0 in terms or []:
+        tl = t0.lower()
         if "cataract" in tl:
             mesh += ["Cataract", "Cataract Extraction"]
-        if "phaco" in tl or "phacoemulsification" in tl:
-            mesh += ["Phacoemulsification"]
-        if "femtosecond" in tl or "flacs" in tl:
-            mesh += ["Femtosecond Laser Surgery"]
-
-        # Intraocular lens / EDOF / multifocal
-        if ("intraocular lens" in tl or "intra-ocular lens" in tl or "iol" in tl or
-            "lens" in tl or "edof" in tl or "extended depth" in tl or "extended range" in tl or
-            "multifocal" in tl or "monofocal" in tl or "diffractive" in tl or "nondiffractive" in tl or "non-diffractive" in tl):
-            mesh += ["Lenses, Intraocular", "Lens Implantation, Intraocular"]
-
-        # Glaucoma / glaucoma surgery
         if "glaucoma" in tl:
             mesh += ["Glaucoma"]
-        if "trabeculectomy" in tl:
-            mesh += ["Trabeculectomy"]
-        if "tube" in tl and "shunt" in tl:
-            mesh += ["Glaucoma Drainage Implants"]
-
-        # Outcomes (common)
-        if "visual acuity" in tl or "bcva" in tl:
-            mesh += ["Visual Acuity"]
-        if "contrast" in tl and "sensit" in tl:
-            mesh += ["Contrast Sensitivity"]
-        if "photic" in tl or "halo" in tl or "glare" in tl:
-            mesh += ["Glare"]
-
-        # Study design hints
-        if "random" in tl or "trial" in tl:
-            mesh += ["Randomized Controlled Trials as Topic"]
-        if "meta-analysis" in tl or "systematic review" in tl:
-            mesh += ["Meta-Analysis as Topic", "Systematic Reviews as Topic"]
-
-    out: List[str] = []
-    seen: set = set()
+        if "intraocular lens" in tl or "iol" in tl or "lens" in tl:
+            mesh += ["Lenses, Intraocular", "Lens Implantation, Intraocular"]
+    out, seen = [], set()
     for m0 in mesh:
-        k = m0.lower().strip()
-        if k and k not in seen:
+        k = m0.lower()
+        if k not in seen:
             seen.add(k)
             out.append(m0)
     return out
@@ -848,50 +775,26 @@ def propose_mesh_candidates(terms: List[str]) -> List[str]:
 def question_to_protocol_heuristic(question: str) -> Protocol:
     q = norm_text(question)
     left, right = split_vs(q)
-
-    # Best-effort English seeds (important when question contains CJK and LLM is disabled)
-    left_seed = ascii_seed_from_text(left)
-    right_seed = ascii_seed_from_text(right)
-
-    I0 = left_seed or left
-    C0 = right_seed or right
-
-    proto = Protocol(P="", I=I0, C=C0, O="", goal_mode=st.session_state.get("goal_mode", "Fast / feasible (gap-fill)"))
-
-    # If comparator equals intervention (e.g., "EDOF vs EDOF"), drop C to avoid zero-hit AND blocks
+    proto = Protocol(P="", I=left, C=right, O="", goal_mode=st.session_state.get("goal_mode","Fast / feasible (gap-fill)"))
     if proto.I and proto.C and proto.I.strip().lower() == proto.C.strip().lower():
-        proto.C = ""
-
+        proto.C = "other comparator (different model/design)"
     proto.P_syn = expand_terms(proto.P)
     proto.I_syn = expand_terms(proto.I)
     proto.C_syn = expand_terms(proto.C)
     proto.O_syn = expand_terms(proto.O)
-
-    # Add context for EDOF / IOL comparisons if missing (keeps recall closer to manual searches)
-    i_syn_l = " ".join([x.lower() for x in (proto.I_syn or [])])
-    if ("edof" in i_syn_l or "extended depth" in i_syn_l or "extended range" in i_syn_l) and ("intraocular lens" not in i_syn_l and "iol" not in i_syn_l):
-        proto.I_syn.extend(["intraocular lens", "IOL"])
-
     proto.mesh_P = propose_mesh_candidates(proto.P_syn)
     proto.mesh_I = propose_mesh_candidates(proto.I_syn)
     proto.mesh_C = propose_mesh_candidates(proto.C_syn)
     proto.mesh_O = propose_mesh_candidates(proto.O_syn)
-
     return proto
 
 def question_to_protocol_llm(question: str) -> Tuple[Protocol, str]:
-    """Return (protocol, question_en).
-
-    - If BYOK LLM is enabled: translate to English, propose PICO, expansions, and MeSH candidates.
-    - If LLM is disabled/unavailable: use heuristic PICO and best-effort English seed extraction to avoid
-      sending CJK text directly to PubMed.
+    """
+    Returns (protocol, question_en).
+    If LLM unavailable, falls back to heuristic and uses original question as question_en.
     """
     if not llm_available():
-        proto = question_to_protocol_heuristic(question)
-        q_en = auto_question_en(question)
-        if not q_en:
-            q_en = norm_text(question)
-        return proto, q_en
+        return question_to_protocol_heuristic(question), norm_text(question)
 
     sys = (
         "You are an evidence synthesis assistant. "
@@ -901,27 +804,16 @@ def question_to_protocol_llm(question: str) -> Tuple[Protocol, str]:
         "(3) propose search expansions (synonyms/acronyms) and MeSH candidates. "
         "Return STRICT JSON with keys: question_en, P, I, C, O, NOT, P_syn, I_syn, C_syn, O_syn, mesh_P, mesh_I, mesh_C, mesh_O."
     )
-    user = json.dumps(
-        {
-            "question": question,
-            "article_type": st.session_state.get("article_type", "不限"),
-            "goal_mode": st.session_state.get("goal_mode", "Fast / feasible (gap-fill)"),
-            "default_NOT": st.session_state.get("default_NOT", "animal OR mice OR rat OR in vitro OR case report"),
-        },
-        ensure_ascii=False,
-    )
-
-    d = llm_json(sys, user, max_tokens=1600) or {}
-
-    q_en = norm_text(d.get("question_en") or "") or auto_question_en(question)
-
+    user = f"Question: {question}\nReturn JSON only."
+    d = llm_json(sys, user, max_tokens=900) or {}
+    q_en = norm_text(d.get("question_en") or "")
     proto = Protocol(
         P=norm_text(d.get("P") or ""),
         I=norm_text(d.get("I") or ""),
         C=norm_text(d.get("C") or ""),
         O=norm_text(d.get("O") or ""),
-        NOT=norm_text(d.get("NOT") or st.session_state.get("default_NOT") or ""),
-        goal_mode=st.session_state.get("goal_mode", "Fast / feasible (gap-fill)"),
+        NOT=norm_text(d.get("NOT") or "animal OR mice OR rat OR in vitro OR case report"),
+        goal_mode=st.session_state.get("goal_mode","Fast / feasible (gap-fill)"),
         P_syn=[norm_text(x) for x in (d.get("P_syn") or []) if norm_text(x)],
         I_syn=[norm_text(x) for x in (d.get("I_syn") or []) if norm_text(x)],
         C_syn=[norm_text(x) for x in (d.get("C_syn") or []) if norm_text(x)],
@@ -931,19 +823,17 @@ def question_to_protocol_llm(question: str) -> Tuple[Protocol, str]:
         mesh_C=[norm_text(x) for x in (d.get("mesh_C") or []) if norm_text(x)],
         mesh_O=[norm_text(x) for x in (d.get("mesh_O") or []) if norm_text(x)],
     )
-
-    # If LLM returned empty protocol, fall back to heuristic
+    # fallback: if any field blank, use heuristic fill
     if not (proto.I or proto.C or proto.P or proto.O):
         proto2 = question_to_protocol_heuristic(question)
         proto.P, proto.I, proto.C, proto.O = proto2.P, proto2.I, proto2.C, proto2.O
-
-    # If comparator equals intervention, drop comparator axis to avoid over-restrictive AND
-    if proto.I and proto.C and proto.I.strip().lower() == proto.C.strip().lower():
-        proto.C = ""
-        proto.C_syn = []
-
+    if not q_en:
+        q_en = norm_text(question)
     return proto, q_en
 
+# =========================================================
+# PubMed query builder
+# =========================================================
 def quote_tiab(term: str) -> str:
     term = term.strip()
     if not term:
@@ -974,17 +864,13 @@ def or_block(items: List[str]) -> str:
 def build_pubmed_query(proto: Protocol, article_type: str, custom_filter: str) -> str:
     # Topic blocks: use synonyms (tiab) + mesh candidates
     def build_axis(text: str, syn: List[str], mesh: List[str]) -> str:
-        tiabs: List[str] = []
-        if (text or "").strip() and not has_cjk(text):
+        tiabs = []
+        if text.strip():
             tiabs.append(quote_tiab(text))
         for s in (syn or []):
-            s = (s or "").strip()
-            if not s or has_cjk(s):
-                continue
-            if (text or "").strip() and s.lower() == (text or "").strip().lower():
-                continue
-            tiabs.append(quote_tiab(s))
-        meshes = [mesh_term(m) for m in (mesh or []) if (m or "").strip()]
+            if s.strip() and s.strip().lower() != text.strip().lower():
+                tiabs.append(quote_tiab(s))
+        meshes = [mesh_term(m) for m in (mesh or []) if m.strip()]
         block = or_block([b for b in (or_block(meshes), or_block(tiabs)) if b])
         return block
 
@@ -995,18 +881,9 @@ def build_pubmed_query(proto: Protocol, article_type: str, custom_filter: str) -
 
     blocks = [b for b in [P_block, I_block, C_block, O_block] if b]
     if not blocks:
-        # last-resort fallback: use English seed; never send CJK text directly to PubMed
-        qseed = norm_text(st.session_state.get("question_en") or "")
-        if not qseed or has_cjk(qseed):
-            qseed = ascii_seed_from_text(st.session_state.get("question") or "")
-        if qseed:
-            blocks = [quote_tiab(qseed)]
-        else:
-            blocks = []
+        blocks = [quote_tiab(norm_text(st.session_state.get("question_en") or st.session_state.get("question") or ""))]
 
     q = " AND ".join([f"({b})" if " OR " in b else b for b in blocks if b])
-    if not q.strip():
-        return ""
 
     # Article type filter (optional)
     f = ARTICLE_TYPE_FILTERS.get(article_type, "")
@@ -1023,6 +900,11 @@ def build_pubmed_query(proto: Protocol, article_type: str, custom_filter: str) -
         q = f"({q}) NOT ({NOT})"
 
     return q
+
+# =========================================================
+# PubMed eUtils
+# =========================================================
+EUTILS = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 
 def esearch(term: str, retstart: int = 0, retmax: int = 200) -> Tuple[List[str], int, str, List[str]]:
     warnings = []
@@ -1667,12 +1549,6 @@ def run_pipeline():
     if not st.session_state.get("pubmed_query"):
         st.session_state["pubmed_query"] = auto_q
 
-    # If query is still empty, stop gracefully (avoid sending non-English text to PubMed)
-    if not (st.session_state.get("pubmed_query") or "").strip():
-        st.session_state["pubmed_records"] = pd.DataFrame()
-        st.session_state["diagnostics"] = {"warnings": ["PubMed query is empty. If your question is non-English, enable BYOK LLM or edit the query in Step 1 using English keywords/MeSH."]}
-        return
-
     # Fetch pubmed
     df, diag = fetch_pubmed(st.session_state["pubmed_query"], max_records=int(st.session_state.get("max_pubmed_records",1000) or 1000), page_size=int(st.session_state.get("pubmed_page_size",200) or 200))
     st.session_state["pubmed_records"] = df
@@ -1902,9 +1778,6 @@ with tabs[1]:
     else:
         with st.expander(t("pico_edit"), expanded=True):
             # Manual PICO correction (core ask)
-            st.caption(t("english_hint"))
-            q_en_in = st.text_input("Question (English seed for PubMed)", value=st.session_state.get("question_en",""), key="edit_question_en")
-
             c1, c2 = st.columns(2)
             with c1:
                 P = st.text_input("P", value=proto.P, key="edit_P")
@@ -1926,8 +1799,6 @@ with tabs[1]:
 
             if st.button(t("pico_apply"), type="primary"):
                 proto.P = norm_text(P); proto.I = norm_text(I_); proto.C = norm_text(C); proto.O = norm_text(O)
-                st.session_state["question_en"] = norm_text(q_en_in)
-
                 proto.NOT = norm_text(NOT)
                 proto.P_syn = [norm_text(x) for x in re.split(r"[,\n]+", P_syn or "") if norm_text(x)]
                 proto.I_syn = [norm_text(x) for x in re.split(r"[,\n]+", I_syn or "") if norm_text(x)]
