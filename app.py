@@ -641,52 +641,51 @@ with st.sidebar:
     st.subheader(t("byok_title"))
     st.checkbox(t("byok_toggle"), key="byok_enabled")
     st.caption(t("byok_notice"))
-    st.session_state["byok_consent"] = st.checkbox(t("byok_consent"), value=bool(st.session_state.get("byok_consent", False)))
-    # Provider / Base URL / Model
-    provider = st.selectbox("Provider", options=list(PROVIDER_PRESETS.keys()) + ["自訂/相容API"], key="byok_provider")
-    if provider != "自訂/相容API":
-        st.caption(f"預設 Base URL：{PROVIDER_PRESETS[provider]['base_url']}")
-        c_apply, c_spacer = st.columns([1.3, 2.7])
-        with c_apply:
-            if st.button("套用預設 Base URL", key="byok_apply_base"):
-                st.session_state["byok_base_url"] = PROVIDER_PRESETS[provider]["base_url"]
-        with c_spacer:
-            st.write("")
-    st.text_input("Base URL (OpenAI-compatible)", key="byok_base_url", help="例如 https://api.openai.com/v1 或你的相容端點（OpenRouter/Groq/Ollama/vLLM/LM Studio 等）")
+    st.checkbox(t("byok_consent"), value=bool(st.session_state.get("byok_consent", False)), key="byok_consent")
 
-    model_opts = _provider_model_options(provider) if provider != "自訂/相容API" else ["（自訂）"]
-    # Use a separate widget key so we can safely map into byok_model
-    current_model = (st.session_state.get("byok_model") or "").strip()
-    default_idx = 0
-    if current_model and current_model in model_opts:
+    # Provider / Base URL / Model (OpenAI-compatible)
+    provider = st.selectbox("Provider", options=list(PROVIDER_PRESETS.keys()) + ["自訂/相容API"], key="byok_provider")
+    preset_base = PROVIDER_PRESETS.get(provider, {}).get("base_url", "https://api.openai.com/v1") if provider != "自訂/相容API" else st.session_state.get("byok_base_url","https://api.openai.com/v1")
+    if provider != "自訂/相容API":
+        st.caption(f"預設 Base URL：{preset_base}")
+        if st.button("套用預設 Base URL", key="byok_apply_base"):
+            st.session_state["byok_base_url"] = preset_base
+
+    st.text_input("Base URL (OpenAI-compatible)", value=st.session_state.get("byok_base_url", preset_base), key="byok_base_url")
+
+    model_opts = _provider_model_options(provider)
+    current_model = st.session_state.get("byok_model", model_opts[0] if model_opts else "gpt-4o-mini")
+    if current_model in model_opts:
         default_idx = model_opts.index(current_model)
     elif "（自訂）" in model_opts:
         default_idx = model_opts.index("（自訂）")
+    else:
+        default_idx = 0
 
     selected_model = st.selectbox("Model（下拉可選；也可自訂）", options=model_opts, index=default_idx, key="byok_model_dropdown")
     if selected_model == "（自訂）":
-        st.text_input("自訂 Model ID", key="byok_model", help="填完整 model id（依你選的 Provider/端點而定）。")
+        st.text_input("自訂 Model ID", value=(current_model if current_model not in model_opts else ""), key="byok_model_custom", help="填完整 model id（依你選的 Provider/端點而定）。")
+        st.session_state["byok_model"] = st.session_state.get("byok_model_custom","").strip() or current_model
     else:
-        # sync dropdown selection into byok_model
         st.session_state["byok_model"] = selected_model
 
-        st.text_input("API Key", type="password", key="byok_key")
-        st.slider("Temperature", 0.0, 1.0, float(st.session_state.get("byok_temp",0.2)), 0.05, key="byok_temp")
-        st.button(t("byok_clear"), on_click=lambda: st.session_state.update({"byok_key": ""}))
+    st.text_input("API Key", type="password", key="byok_key")
+    st.slider("Temperature", 0.0, 1.0, float(st.session_state.get("byok_temp", 0.2)), 0.05, key="byok_temp")
+    st.button(t("byok_clear"), key="byok_clear_btn", on_click=lambda: st.session_state.update({"byok_key": ""}))
 
-        st.markdown("---")
-        st.subheader(t("search_settings"))
-        st.selectbox(t("article_type"), options=["不限","RCT","SR/MA","NMA","Cohort","Case-control"], key="article_type")
-        st.text_input(t("custom_filter"), key="custom_pubmed_filter", help="例如：humans[MeSH Terms] AND english[lang]；會 AND 到搜尋式內。")
-        # PubMed fetch cap (default 1000); increase if you expect more records.
-        _max_label = "最大抓取篇數（PubMed）" if st.session_state.get("UI_LANG","zh-TW") == "zh-TW" else "Max PubMed records to fetch"
-        st.select_slider(_max_label, options=[200, 500, 1000, 2000, 5000], key="max_pubmed_records")
-        st.caption("提示：抓取越多篇，越慢；PubMed/eUtils 有流量限制。若你預期 >5000，建議改用本機版或分批檢索。" if st.session_state.get("UI_LANG","zh-TW") == "zh-TW" else "Tip: higher limits run slower and may hit eUtils throttling. For >5000, use local/batched search.")
-        st.selectbox(t("goal_mode"), options=["Fast / feasible (gap-fill)", "Rigorous / narrow scope"], key="goal_mode")
+    st.markdown("---")
+    st.subheader(t("search_settings"))
+    st.selectbox(t("article_type"), options=["不限","RCT","SR/MA","NMA","Cohort","Case-control"], key="article_type")
+    st.text_input(t("custom_filter"), key="custom_pubmed_filter", help="例如：humans[MeSH Terms] AND english[lang]；會 AND 到搜尋式內。")
+    # PubMed fetch cap (default 1000); increase if you expect more records.
+    _max_label = "最大抓取篇數（PubMed）" if st.session_state.get("UI_LANG","zh-TW") == "zh-TW" else "Max PubMed records to fetch"
+    st.select_slider(_max_label, options=[200, 500, 1000, 2000, 5000], key="max_pubmed_records")
+    st.caption("提示：抓取越多篇，越慢；PubMed/eUtils 有流量限制。若你預期 >5000，建議改用本機版或分批檢索。" if st.session_state.get("UI_LANG","zh-TW") == "zh-TW" else "Tip: higher limits run slower and may hit eUtils throttling. For >5000, use local/batched search.")
+    st.selectbox(t("goal_mode"), options=["Fast / feasible (gap-fill)", "Rigorous / narrow scope"], key="goal_mode")
 
-    # =========================================================
-    # Header
-    # =========================================================
+# =========================================================
+# Header
+# =========================================================
 st.title(t("app_title"))
 st.caption(f"{t('author')}　|　Language：{'繁體中文' if st.session_state.get('UI_LANG','zh-TW')=='zh-TW' else 'English'}　|　免責聲明：僅供學術用途；請自行驗證所有結果與引用。")
 
@@ -2365,8 +2364,14 @@ with tabs[5]:
         # Validation preview (non-blocking, red warnings)
         st.markdown("---")
         st.markdown("#### Validation (non-blocking)")
-        out_filter = st.text_input(t("ma_outcome_label"), key="ma_outcome_input")
-        meas = st.selectbox(t("ma_measure"), options=["OR","RR","HR","MD","SMD"], index=["OR","RR","HR","MD","SMD"].index(st.session_state.get("ma_measure_choice","OR")), key="ma_measure_choice")
+        out_filter = st.text_input( t("ma_outcome_label"), value=st.session_state.get("ma_outcome_input",""), key="ma_outcome_input_step5", help="例如：visual acuity / photic / defocus；用 substring 匹配。")
+        _meas_opts = ["OR","RR","HR","MD","SMD"]
+        _meas_default = st.session_state.get("ma_measure_choice","OR")
+        _meas_idx = _meas_opts.index(_meas_default) if _meas_default in _meas_opts else 0
+        meas = st.selectbox(t("ma_measure"), options=_meas_opts, index=_meas_idx, key="ma_measure_choice_step5")
+        # Sync into downstream defaults (Step 6)
+        st.session_state["ma_outcome_input"] = out_filter
+        st.session_state["ma_measure_choice"] = meas
         rep = validate_extraction(edited, meas, out_filter)
         if rep.empty:
             st.caption("No rows matched the current outcome/measure filter, or extraction table is empty.")
