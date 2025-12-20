@@ -457,6 +457,15 @@ def init_state():
     ss.setdefault("byok_temp", 0.2)
     ss.setdefault("byok_consent", False)
 
+    ss.setdefault("byok_last_ok_endpoint", "")
+    ss.setdefault("byok_last_error", "")
+
+    # MeSH lookup (NLM MeSH RDF Lookup Service)
+    ss.setdefault("mesh_lookup_enabled", True)
+    ss.setdefault("mesh_lookup_limit", 6)
+    ss.setdefault("mesh_lookup_match", "contains")
+
+
     # links
     ss.setdefault("RESOLVER_BASE", "")
     ss.setdefault("EZPROXY_PREFIX", "")
@@ -522,6 +531,14 @@ def llm_available() -> bool:
     return bool(st.session_state.get("byok_enabled")) and bool(st.session_state.get("byok_key", "").strip()) and bool(st.session_state.get("byok_consent"))
 
 def call_openai_compatible(messages: List[Dict[str, str]], max_tokens: int = 1400) -> str:
+    """Call an OpenAI-compatible endpoint.
+
+    Strategy:
+      1) Try Chat Completions: POST {base_url}/chat/completions
+      2) If that fails, try Responses: POST {base_url}/responses
+
+    This improves compatibility with providers/models that are moving to the Responses API.
+    """
     base_url = (st.session_state.get("byok_base_url") or "").strip().rstrip("/")
     api_key = (st.session_state.get("byok_key") or "").strip()
     model = (st.session_state.get("byok_model") or "").strip()
@@ -530,15 +547,73 @@ def call_openai_compatible(messages: List[Dict[str, str]], max_tokens: int = 140
     if not (base_url and api_key and model):
         raise RuntimeError("LLM 未設定完成（base_url / key / model）。")
 
-    url = f"{base_url}/chat/completions"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    payload = {"model": model, "messages": messages, "temperature": temperature, "max_tokens": max_tokens}
 
+    def _record(ok_endpoint: str = "", err: str = ""):
+        # Keep lightweight debug signals in UI.
+        st.session_state["byok_last_ok_endpoint"] = ok_endpoint or ""
+        st.session_state["byok_last_error"] = err or ""
+
+    # ---- 1) Chat Completions ----
+    try:
+        url = f"{base_url}/chat/completions"
+        payload = {"model": model, "messages": messages, "temperature": temperature, "max_tokens": max_tokens}
+        r = requests.post(url, headers=headers, json=payload, timeout=75)
+        if r.status_code == 200:
+            data = r.json()
+            out = (data.get("choices", [{}])[0].get("message", {}) or {}).get("content", "")
+            if isinstance(out, str) and out.strip():
+                _record(ok_endpoint="chat/completions", err="")
+                return out
+            # If response shape is odd, fall through to try /responses
+            raise RuntimeError("chat/completions 回傳格式異常或空內容。")
+        raise RuntimeError(f"chat/completions HTTP {r.status_code} / {r.text[:300]}")
+    except Exception as e_chat:
+        _record(ok_endpoint="", err=str(e_chat)[:300])
+
+    # ---- 2) Responses API ----
+    url = f"{base_url}/responses"
+    payload = {
+        "model": model,
+        # Per OpenAI docs, simple message arrays are compatible as `input` in Responses.
+        "input": messages,
+        "temperature": temperature,
+        "max_output_tokens": max_tokens,
+    }
     r = requests.post(url, headers=headers, json=payload, timeout=75)
     if r.status_code != 200:
+        _record(ok_endpoint="", err=f"responses HTTP {r.status_code} / {r.text[:300]}")
         raise RuntimeError(f"LLM 呼叫失敗：HTTP {r.status_code} / {r.text[:300]}")
     data = r.json()
-    return data["choices"][0]["message"]["content"]
+
+    # Prefer official helper field when present.
+    if isinstance(data, dict):
+        if isinstance(data.get("output_text"), str) and data.get("output_text").strip():
+            _record(ok_endpoint="responses", err="")
+            return data["output_text"]
+
+        # Otherwise, walk the typed `output` list.
+        out_parts: List[str] = []
+        for item in (data.get("output") or []):
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") != "message":
+                continue
+            for c in (item.get("content") or []):
+                if not isinstance(c, dict):
+                    continue
+                if c.get("type") in ("output_text", "text"):
+                    txt = c.get("text") or ""
+                    if isinstance(txt, str) and txt:
+                        out_parts.append(txt)
+        out = "\\n".join([x for x in out_parts if x.strip()]).strip()
+        if out:
+            _record(ok_endpoint="responses", err="")
+            return out
+
+    _record(ok_endpoint="", err="responses 回傳格式異常或空內容。")
+    raise RuntimeError("LLM 回傳格式異常或空內容。")
+
 
 def llm_json(system: str, user: str, max_tokens: int = 1200) -> Optional[dict]:
     if not llm_available():
@@ -671,10 +746,24 @@ with st.sidebar:
 
     st.text_input("API Key", type="password", key="byok_key")
     st.slider("Temperature", 0.0, 1.0, float(st.session_state.get("byok_temp", 0.2)), 0.05, key="byok_temp")
+    # LLM debug status (helps identify silent fallback to heuristic mode)
+    _ok_ep = (st.session_state.get("byok_last_ok_endpoint") or "").strip()
+    _err = (st.session_state.get("byok_last_error") or "").strip()
+    if _ok_ep:
+        st.caption(f"LLM last OK endpoint: {_ok_ep}")
+    if _err:
+        st.caption(f"LLM last error: {_err}")
+
     st.button(t("byok_clear"), key="byok_clear_btn", on_click=lambda: st.session_state.update({"byok_key": ""}))
 
     st.markdown("---")
     st.subheader(t("search_settings"))
+    # MeSH suggestion enhancement (no key required)
+    st.checkbox("MeSH Lookup（NLM）", key="mesh_lookup_enabled",
+                help="使用 NLM MeSH RDF Lookup Service 自動補全 MeSH Heading。LLM 掛掉時也能維持 MeSH 建議品質。")
+    st.slider("MeSH 建議上限（每個詞）", 1, 15, int(st.session_state.get("mesh_lookup_limit", 6)), 1, key="mesh_lookup_limit")
+    st.selectbox("MeSH Match 模式", options=["contains", "exact", "startswith"], key="mesh_lookup_match")
+
     st.selectbox(t("article_type"), options=["不限","RCT","SR/MA","NMA","Cohort","Case-control"], key="article_type")
     st.text_input(t("custom_filter"), key="custom_pubmed_filter", help="例如：humans[MeSH Terms] AND english[lang]；會 AND 到搜尋式內。")
     # PubMed fetch cap (default 1000); increase if you expect more records.
@@ -753,23 +842,73 @@ def expand_terms(text: str) -> List[str]:
             out.append(s2)
     return out
 
+def mesh_lookup_descriptors(label: str, limit: int = 6, match: str = "contains") -> List[str]:
+    """Lookup MeSH descriptors by label (no API key needed).
+
+    Uses NLM MeSH RDF Lookup Service:
+      GET https://id.nlm.nih.gov/mesh/lookup/descriptor?label=...&match=...&limit=...
+    """
+    label = (label or "").strip()
+    if not label:
+        return []
+    limit = int(limit or 6)
+    limit = max(1, min(limit, 20))
+    match = (match or "contains").strip() or "contains"
+
+    url = "https://id.nlm.nih.gov/mesh/lookup/descriptor"
+    params = {"label": label, "match": match, "limit": limit}
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        out = []
+        for it in (data or []):
+            if isinstance(it, dict) and (it.get("label") or "").strip():
+                out.append(it["label"].strip())
+        return out
+    except Exception:
+        return []
+
+
 def propose_mesh_candidates(terms: List[str]) -> List[str]:
-    mesh = []
+    """Propose MeSH headings for a list of terms.
+
+    - Keeps your original heuristic mappings (fast, no network).
+    - Optionally enhances via NLM MeSH RDF Lookup Service (if enabled).
+    """
+    mesh: List[str] = []
+
+    # --- original heuristics (keep) ---
     for t0 in terms or []:
-        tl = t0.lower()
+        tl = (t0 or "").lower()
         if "cataract" in tl:
             mesh += ["Cataract", "Cataract Extraction"]
         if "glaucoma" in tl:
             mesh += ["Glaucoma"]
         if "intraocular lens" in tl or "iol" in tl or "lens" in tl:
             mesh += ["Lenses, Intraocular", "Lens Implantation, Intraocular"]
+
+    # --- NLM MeSH lookup (optional) ---
+    if bool(st.session_state.get("mesh_lookup_enabled", True)):
+        lim = int(st.session_state.get("mesh_lookup_limit", 6) or 6)
+        match = (st.session_state.get("mesh_lookup_match", "contains") or "contains").strip()
+        max_terms = 6
+        for t0 in (terms or [])[:max_terms]:
+            t0 = (t0 or "").strip()
+            if not t0:
+                continue
+            mesh += mesh_lookup_descriptors(t0, limit=lim, match=match)
+
+    # --- dedupe (case-insensitive) ---
     out, seen = [], set()
     for m0 in mesh:
-        k = m0.lower()
-        if k not in seen:
+        k = (m0 or "").strip().lower()
+        if k and k not in seen:
             seen.add(k)
-            out.append(m0)
+            out.append((m0 or "").strip())
     return out
+
 
 def question_to_protocol_heuristic(question: str) -> Protocol:
     q = norm_text(question)
@@ -2605,4 +2744,3 @@ with tabs[9]:
     if diag.get("efetch_urls"):
         st.write("efetch_urls:")
         st.code("\n".join(diag["efetch_urls"]), language="text")
-
