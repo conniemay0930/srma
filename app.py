@@ -453,7 +453,7 @@ def init_state():
     ss.setdefault("byok_enabled", False)
     ss.setdefault("byok_key", "")
     ss.setdefault("byok_base_url", "https://api.openai.com/v1")
-    ss.setdefault("byok_model", "gpt-5.2")
+    ss.setdefault("byok_model", "gpt-4o-mini")
     ss.setdefault("byok_temp", 0.2)
     ss.setdefault("byok_consent", False)
 
@@ -637,16 +637,10 @@ PROVIDER_PRESETS = {
     "OpenAI": {
         "base_url": "https://api.openai.com/v1",
         "models": [
-            "gpt-5.2",
-            "gpt-5.2-thinking",
-            "gpt-5.2-instant",
-            "gpt-5.2-chat-latest",
-            "gpt-5.2-pro",
-            "gpt-5-mini",
-            "gpt-5-nano",
-            "gpt-4.1",
-            "gpt-4o",
             "gpt-4o-mini",
+            "gpt-4o",
+            "gpt-4.1-mini",
+            "gpt-4.1",
             "o4-mini",
         ],
     },
@@ -688,36 +682,6 @@ def _provider_model_options(provider_name: str) -> List[str]:
         # Always allow custom
         return list(opts) + ["（自訂）"]
     return ["（自訂）"]
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_model_ids_from_api(base_url: str, api_key: str) -> List[str]:
-    """
-    Fetch model IDs from an OpenAI-compatible /v1/models endpoint.
-    - Returns a sorted list of model IDs.
-    - On any error, returns an empty list (caller should fallback).
-    """
-    try:
-        base_url = (base_url or "").rstrip("/")
-        api_key = (api_key or "").strip()
-        if not base_url or not api_key:
-            return []
-        url = f"{base_url}/models"
-        headers = {"Authorization": f"Bearer {api_key}"}
-        r = requests.get(url, headers=headers, timeout=12)
-        if r.status_code != 200:
-            return []
-        j = r.json()
-        data = j.get("data") or []
-        ids = []
-        for item in data:
-            mid = item.get("id")
-            if isinstance(mid, str) and mid.strip():
-                ids.append(mid.strip())
-        # Prefer stable ordering
-        ids = sorted(set(ids))
-        return ids
-    except Exception:
-        return []
 
 # =========================================================
 # Sidebar
@@ -764,43 +728,19 @@ with st.sidebar:
 
     st.text_input("Base URL (OpenAI-compatible)", value=st.session_state.get("byok_base_url", preset_base), key="byok_base_url")
 
-    # Model list can be either preset or fetched dynamically from /v1/models
-    st.checkbox(
-        "自動抓取最新模型清單（需要 API Key）",
-        value=bool(st.session_state.get("auto_fetch_models", False)),
-        key="auto_fetch_models",
-        help="會用你填的 Base URL + API Key 呼叫 /v1/models 取得可用模型；失敗時自動退回預設清單。"
-    )
-
-    preset_model_opts = _provider_model_options(provider)
-    fetched_model_opts: List[str] = []
-    if st.session_state.get("auto_fetch_models") and st.session_state.get("byok_key"):
-        fetched_model_opts = fetch_model_ids_from_api(
-            st.session_state.get("byok_base_url", preset_base),
-            st.session_state.get("byok_key", ""),
-        )
-
-    # Merge while keeping UX simple
-    model_opts = (fetched_model_opts or []) + [m for m in preset_model_opts if m not in (fetched_model_opts or [])]
-    # Always ensure custom option
-    if "（自訂）" not in model_opts:
-        model_opts.append("（自訂）")
-
-    current_model = st.session_state.get("byok_model", model_opts[0] if model_opts else "gpt-5.2")
+    model_opts = _provider_model_options(provider)
+    current_model = st.session_state.get("byok_model", model_opts[0] if model_opts else "gpt-4o-mini")
     if current_model in model_opts:
         default_idx = model_opts.index(current_model)
+    elif "（自訂）" in model_opts:
+        default_idx = model_opts.index("（自訂）")
     else:
-        default_idx = (model_opts.index("（自訂）") if "（自訂）" in model_opts else 0)
+        default_idx = 0
 
-    selected_model = st.selectbox("AI Model（可下拉；也可自訂）", options=model_opts, index=default_idx, key="byok_model_dropdown")
+    selected_model = st.selectbox("Model（下拉可選；也可自訂）", options=model_opts, index=default_idx, key="byok_model_dropdown")
     if selected_model == "（自訂）":
-        st.text_input(
-            "自訂 Model ID",
-            value=(current_model if current_model not in model_opts else ""),
-            key="byok_model_custom",
-            help="填完整 model id（依你選的 Provider/端點而定）。例如：gpt-5.2-thinking"
-        )
-        st.session_state["byok_model"] = st.session_state.get("byok_model_custom", "").strip() or current_model
+        st.text_input("自訂 Model ID", value=(current_model if current_model not in model_opts else ""), key="byok_model_custom", help="填完整 model id（依你選的 Provider/端點而定）。")
+        st.session_state["byok_model"] = st.session_state.get("byok_model_custom","").strip() or current_model
     else:
         st.session_state["byok_model"] = selected_model
 
@@ -822,19 +762,7 @@ with st.sidebar:
     st.checkbox("MeSH Lookup（NLM）", key="mesh_lookup_enabled",
                 help="使用 NLM MeSH RDF Lookup Service 自動補全 MeSH Heading。LLM 掛掉時也能維持 MeSH 建議品質。")
     st.slider("MeSH 建議上限（每個詞）", 1, 15, int(st.session_state.get("mesh_lookup_limit", 6)), 1, key="mesh_lookup_limit")
-    _mesh_mode_help = (
-        "這裡是在說：你輸入的詞（例如 myopia）要用什麼規則去比對 MeSH 標題，決定哪些算『命中』並列入建議。\n"
-        "- 包含（較寬鬆）：只要 MeSH 標題裡包含你的詞就算命中（召回高，噪音也可能較多）\n"
-        "- 開頭符合（中等）：MeSH 標題要以你的詞開頭才算命中\n"
-        "- 完全相同（最嚴格）：MeSH 標題必須完全等於你的詞才算命中（精準但容易漏）"
-    )
-    st.selectbox(
-        "MeSH 比對方式（白話）",
-        options=["contains", "startswith", "exact"],
-        key="mesh_lookup_match",
-        format_func=lambda x: {"contains":"包含（較寬鬆）","startswith":"開頭符合（中等）","exact":"完全相同（最嚴格）"}.get(x, x),
-        help=_mesh_mode_help,
-    )
+    st.selectbox("MeSH Match 模式", options=["contains", "exact", "startswith"], key="mesh_lookup_match")
 
     st.selectbox(t("article_type"), options=["不限","RCT","SR/MA","NMA","Cohort","Case-control"], key="article_type")
     st.text_input(t("custom_filter"), key="custom_pubmed_filter", help="例如：humans[MeSH Terms] AND english[lang]；會 AND 到搜尋式內。")
@@ -1501,6 +1429,136 @@ def fixed_effect_meta(df: pd.DataFrame, measure: str) -> Tuple[Optional[dict], p
         })
     result["study_table"] = pd.DataFrame(out_rows)
     return result, pd.DataFrame(skipped)
+def random_effect_meta(df: pd.DataFrame, measure: str, method: str = "DL") -> Tuple[Optional[dict], pd.DataFrame]:
+    """
+    Random-effects meta-analysis (DerSimonian–Laird by default).
+    df must contain Effect, Lower_CI, Upper_CI.
+    Returns (result, skipped_df).
+
+    Notes:
+    - Ratio measures (OR/RR/HR) are pooled on log scale and then exponentiated back.
+    - Heterogeneity: Q, I2, tau^2 are returned (when k>=2).
+    """
+    work = df.copy()
+    work = ensure_columns(work, ["Effect","Lower_CI","Upper_CI","StudyID","First_author","Year","Title"], default="")
+    for c in ["Effect","Lower_CI","Upper_CI"]:
+        work[c] = pd.to_numeric(work[c], errors="coerce")
+
+    skipped = []
+    rows = []
+    for _, r in work.iterrows():
+        eff = r.get("Effect")
+        lcl = r.get("Lower_CI")
+        ucl = r.get("Upper_CI")
+        if pd.isna(eff) or pd.isna(lcl) or pd.isna(ucl):
+            skipped.append({**r.to_dict(), "skip_reason":"Missing Effect/CI"})
+            continue
+
+        se = se_from_ci(float(eff), float(lcl), float(ucl), ratio=(measure in RATIO_MEASURES))
+        if se is None or (not np.isfinite(se)) or se <= 0:
+            skipped.append({**r.to_dict(), "skip_reason":"Invalid CI/SE"})
+            continue
+
+        # transform if ratio
+        if measure in RATIO_MEASURES:
+            if eff <= 0 or lcl <= 0 or ucl <= 0:
+                skipped.append({**r.to_dict(), "skip_reason":"Ratio measure must be > 0"})
+                continue
+            theta = math.log(float(eff))
+        else:
+            theta = float(eff)
+
+        var = se * se
+        w = 1.0 / var
+        rows.append((theta, var, w, r))
+
+    if not rows:
+        return None, pd.DataFrame(skipped)
+
+    k = len(rows)
+    sumw = sum(w for _,_,w,_ in rows)
+    theta_fe = sum(w*theta for theta,_,w,_ in rows) / sumw
+
+    # heterogeneity
+    Q = sum(w * (theta - theta_fe)**2 for theta,_,w,_ in rows)
+    df_q = max(0, k - 1)
+    # C for DL
+    sumw2 = sum(w*w for _,_,w,_ in rows)
+    C = sumw - (sumw2 / sumw) if sumw > 0 else 0.0
+    tau2 = 0.0
+    if k >= 2 and C > 0:
+        tau2 = max(0.0, (Q - df_q) / C)
+
+    # random weights
+    rows_re = []
+    for theta, var, _, r in rows:
+        wr = 1.0 / (var + tau2)
+        rows_re.append((theta, var, wr, r))
+
+    sumwr = sum(wr for _,_,wr,_ in rows_re)
+    theta_re = sum(wr*theta for theta,_,wr,_ in rows_re) / sumwr
+    se_re = math.sqrt(1.0 / sumwr) if sumwr > 0 else float("nan")
+
+    z = 1.96
+    lcl_hat = theta_re - z * se_re
+    ucl_hat = theta_re + z * se_re
+
+    # transform back
+    if measure in RATIO_MEASURES:
+        pooled = math.exp(theta_re)
+        pooled_lcl = math.exp(lcl_hat)
+        pooled_ucl = math.exp(ucl_hat)
+    else:
+        pooled = theta_re
+        pooled_lcl = lcl_hat
+        pooled_ucl = ucl_hat
+
+    I2 = 0.0
+    if k >= 2 and Q > 0:
+        I2 = max(0.0, (Q - df_q) / Q) * 100.0
+
+    p_Q = None
+    if k >= 2 and HAS_SCIPY:
+        try:
+            from scipy.stats import chi2
+            p_Q = float(1.0 - chi2.cdf(Q, df_q))
+        except Exception:
+            p_Q = None
+
+    result = {
+        "measure": measure,
+        "model": "Random effects (DerSimonian–Laird)",
+        "method": method,
+        "k": k,
+        "pooled": pooled,
+        "pooled_lcl": pooled_lcl,
+        "pooled_ucl": pooled_ucl,
+        "theta_hat": theta_re,
+        "se_hat": se_re,
+        "Q": float(Q),
+        "df_Q": int(df_q),
+        "p_Q": p_Q,
+        "I2": float(I2),
+        "tau2": float(tau2),
+    }
+
+    # per-study weights
+    out_rows = []
+    for theta, var, wr, r in rows_re:
+        weight = wr / sumwr if sumwr > 0 else 0.0
+        out_rows.append({
+            "StudyID": r.get("StudyID",""),
+            "First_author": r.get("First_author",""),
+            "Year": r.get("Year",""),
+            "Title": r.get("Title",""),
+            "Effect": float(r.get("Effect")),
+            "Lower_CI": float(r.get("Lower_CI")),
+            "Upper_CI": float(r.get("Upper_CI")),
+            "Weight": float(weight),
+        })
+    result["study_table"] = pd.DataFrame(out_rows)
+    return result, pd.DataFrame(skipped)
+
 
 def plot_forest(result: dict, title: str = ""):
     df = result.get("study_table")
@@ -1515,6 +1573,23 @@ def plot_forest(result: dict, title: str = ""):
 
     pooled = result["pooled"]; pooled_lcl = result["pooled_lcl"]; pooled_ucl = result["pooled_ucl"]
     measure = result["measure"]
+
+    # Heterogeneity (shown when available; typically random-effects)
+    het_parts = []
+    if result.get("Q") is not None and result.get("df_Q") is not None:
+        try:
+            het_parts.append(f'Q={float(result.get("Q")):.2f}')
+            het_parts.append(f'df={int(result.get("df_Q"))}')
+            if result.get("p_Q") is not None:
+                het_parts.append(f'p={float(result.get("p_Q")):.3g}')
+            if result.get("I2") is not None:
+                het_parts.append(f'I²={float(result.get("I2")):.1f}%')
+            if result.get("tau2") is not None:
+                het_parts.append(f'τ²={float(result.get("tau2")):.4g}')
+        except Exception:
+            pass
+    if het_parts:
+        st.caption("Heterogeneity: " + " | ".join(het_parts))
 
     if HAS_PLOTLY:
         y = [f"{a} {y}".strip() for a,y in zip(dfp["First_author"].astype(str), dfp["Year"].astype(str))]
@@ -1535,7 +1610,7 @@ def plot_forest(result: dict, title: str = ""):
             name="Pooled"
         ))
         fig.update_layout(
-            title=title or f"Forest plot ({measure}, fixed effect)",
+            title=title or f"Forest plot ({measure}, {result.get('model','')})",
             xaxis_title=measure,
             yaxis_title="Study",
             height=max(380, 45*(len(dfp)+2)),
@@ -1552,7 +1627,7 @@ def plot_forest(result: dict, title: str = ""):
         ax.set_yticks(y_pos)
         ax.set_yticklabels(labels)
         ax.set_xlabel(measure)
-        ax.set_title(title or f"Forest plot ({measure}, fixed effect)")
+        ax.set_title(title or f"Forest plot ({measure}, {result.get('model','')})")
         st.pyplot(fig)
     else:
         st.info("環境缺少 Plotly / matplotlib：改以表格顯示森林圖資料。")
@@ -2605,7 +2680,7 @@ with tabs[6]:
         df_ex = ensure_columns(df_ex, ["OutcomeLabel","Effect_measure","Effect","Lower_CI","Upper_CI","First_author","Year","Title","PMID"], default="")
         outcome = st.text_input(t("ma_outcome_label"), key="ma_outcome_input", help="例如：'visual acuity'、'photic'、'defocus'。用 substring 匹配。")
         measure = st.selectbox(t("ma_measure"), options=["OR","RR","HR","MD","SMD"], key="ma_measure_choice")
-        model = st.selectbox("Model", options=["Fixed effect"], key="ma_model_choice")
+        model = st.selectbox("Model", options=["Fixed effect","Random effects (DerSimonian–Laird)"], key="ma_model_choice")
         st.caption("按鈕執行：避免你在 Step 5 輸入時反覆 rerun 造成消失或跳動。")
 
         if st.button(t("ma_run"), type="primary"):
@@ -2621,13 +2696,17 @@ with tabs[6]:
                 st.warning("找不到符合 outcome + measure 的列。請回 Step 5 檢查 OutcomeLabel/Effect_measure。")
                 st.session_state["ma_last_result"] = None
             else:
-                res, skipped = fixed_effect_meta(work, measure.upper().strip())
+                if model.startswith("Fixed"):
+                    res, skipped = fixed_effect_meta(work, measure.upper().strip())
+                else:
+                    res, skipped = random_effect_meta(work, measure.upper().strip())
+
                 st.session_state["ma_last_result"] = res
                 st.session_state["ma_skipped_rows"] = skipped
                 if res is None:
                     st.error("沒有可用的列（可能 CI/Effect 不合法）。請看下方 skipped rows。")
                 else:
-                    st.success(f"Fixed-effect MA 完成：k={res['k']}；pooled={res['pooled']:.3g} (95% CI {res['pooled_lcl']:.3g}–{res['pooled_ucl']:.3g})")
+                    st.success(f"{res.get('model', 'MA')} 完成：k={res['k']}；pooled={res['pooled']:.3g} (95% CI {res['pooled_lcl']:.3g}–{res['pooled_ucl']:.3g})")
                     st.markdown("##### Forest plot")
                     plot_forest(res, title=f"{outcome or 'Outcome'} ({measure}, fixed effect)")
                     st.markdown("##### Included rows")
