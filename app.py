@@ -32,12 +32,24 @@ import pandas as pd
 import streamlit as st
 import xml.etree.ElementTree as ET
 
-# Optional: PDF text extraction
+# Optional: PDF text extraction (multiple backends; best-effort, no OCR by default)
 try:
     from PyPDF2 import PdfReader  # type: ignore
     HAS_PYPDF2 = True
 except Exception:
     HAS_PYPDF2 = False
+
+try:
+    import fitz  # PyMuPDF  # type: ignore
+    HAS_FITZ = True
+except Exception:
+    HAS_FITZ = False
+
+try:
+    import pdfplumber  # type: ignore
+    HAS_PDFPLUMBER = True
+except Exception:
+    HAS_PDFPLUMBER = False
 
 # Optional: Plotly for forest plot
 try:
@@ -45,6 +57,13 @@ try:
     HAS_PLOTLY = True
 except Exception:
     HAS_PLOTLY = False
+
+# Optional: Matplotlib fallback
+try:
+    from scipy.stats import chi2  # type: ignore
+    HAS_SCIPY = True
+except Exception:
+    HAS_SCIPY = False
 
 # Optional: Matplotlib fallback
 try:
@@ -136,7 +155,7 @@ I18N = {
         "tabs_overview": "總覽（PRISMA）",
         "tabs_step1": "Step 1 搜尋式（可手改）",
         "tabs_step2": "Step 2 可行性（SR/MA/NMA）",
-        "tabs_step34": "Step 3+4 Records + 粗篩",
+        "tabs_step34": "Step 3+4 Screen by title & abstract（初篩）",
         "tabs_ft": "Step 4b Full text review",
         "tabs_extract": "Step 5 Data extraction（寬表）",
         "tabs_ma": "Step 6 MA + 森林圖",
@@ -193,7 +212,7 @@ I18N = {
         "tabs_overview": "Overview (PRISMA)",
         "tabs_step1": "Step 1 Query (editable)",
         "tabs_step2": "Step 2 Feasibility (SR/MA/NMA)",
-        "tabs_step34": "Step 3+4 Records + Screening",
+        "tabs_step34": "Step 3+4 Screen by title & abstract",
         "tabs_ft": "Step 4b Full-text review",
         "tabs_extract": "Step 5 Data extraction",
         "tabs_ma": "Step 6 MA + Forest",
@@ -929,21 +948,33 @@ def question_to_protocol_heuristic(question: str) -> Protocol:
 def question_to_protocol_llm(question: str) -> Tuple[Protocol, str]:
     """
     Returns (protocol, question_en).
-    If LLM unavailable, falls back to heuristic and uses original question as question_en.
+
+    - If LLM unavailable, fall back to heuristic and use original question as question_en.
+    - LLM output is expected to be concept-level PICO (NOT PubMed syntax).
     """
+    question = norm_text(question)
     if not llm_available():
-        return question_to_protocol_heuristic(question), norm_text(question)
+        return question_to_protocol_heuristic(question), question
 
     sys = (
         "You are an evidence synthesis assistant. "
-        "Given a single research question (may be non-English), you must: "
-        "(1) translate it into concise English; "
-        "(2) propose PICO in English; "
-        "(3) propose search expansions (synonyms/acronyms) and MeSH candidates. "
-        "Return STRICT JSON with keys: question_en, P, I, C, O, NOT, P_syn, I_syn, C_syn, O_syn, mesh_P, mesh_I, mesh_C, mesh_O."
+        "Given ONE research question (may be non-English), produce concept-level outputs (NOT PubMed query syntax): "
+        "(1) translate to concise English (question_en); "
+        "(2) propose PICO (P, I, C, O) in plain English; "
+        "(3) propose synonym expansions for each axis (lists of short phrases/acronyms); "
+        "(4) propose candidate MeSH descriptor labels (do not add [MeSH] tags). "
+        "Return STRICT JSON only with keys: "
+        "question_en, P, I, C, O, NOT, P_syn, I_syn, C_syn, O_syn, mesh_P, mesh_I, mesh_C, mesh_O. "
+        "Rules: "
+        "P/I/C/O must be short noun phrases (no boolean operators, no field tags). "
+        "Synonym lists should be 3–8 items where applicable; include common abbreviations. "
+        "MeSH lists should be 0–8 items where applicable. "
+        "If you are uncertain, leave the field as an empty string or empty list. "
+        "NOT should contain broad exclusions (e.g., animal, in vitro, case report) in plain text."
     )
-    user = f"Question: {question}\nReturn JSON only."
+    user = f"Question: {question}\\nReturn JSON only."
     d = llm_json(sys, user, max_tokens=900) or {}
+
     q_en = norm_text(d.get("question_en") or "")
     proto = Protocol(
         P=norm_text(d.get("P") or ""),
@@ -961,12 +992,14 @@ def question_to_protocol_llm(question: str) -> Tuple[Protocol, str]:
         mesh_C=[norm_text(x) for x in (d.get("mesh_C") or []) if norm_text(x)],
         mesh_O=[norm_text(x) for x in (d.get("mesh_O") or []) if norm_text(x)],
     )
-    # fallback: if any field blank, use heuristic fill
+
+    # Fallback: if any field blank, use heuristic fill
     if not (proto.I or proto.C or proto.P or proto.O):
         proto2 = question_to_protocol_heuristic(question)
         proto.P, proto.I, proto.C, proto.O = proto2.P, proto2.I, proto2.C, proto2.O
+
     if not q_en:
-        q_en = norm_text(question)
+        q_en = question
     return proto, q_en
 
 # =========================================================
@@ -1225,88 +1258,192 @@ def fetch_pubmed(term: str, max_records: int = 200, page_size: int = 200) -> Tup
 # Screening heuristics (fallback when no LLM)
 # =========================================================
 def heuristic_ta(proto: Protocol, row: pd.Series) -> Tuple[str, str, float]:
-    text = (row.get("Title","") or "") + " " + (row.get("Abstract","") or "")
+    """
+    Heuristic title/abstract screening.
+
+    Goal: provide a defensible *audit trail* reason string that is more useful than raw keyword hits.
+    """
+    title = str(row.get("Title","") or "")
+    abstract = str(row.get("Abstract","") or "")
+    pubtypes = str(row.get("PublicationTypes","") or row.get("PublicationType","") or "")
+    text = f"{title} {abstract}".strip()
     text_l = text.lower()
-    hits = 0
-    reasons = []
-    # intervention/comparator cues
-    for w in (proto.I_syn or []) + ([proto.I] if proto.I else []):
-        if w and w.lower() in text_l:
-            hits += 1
-            reasons.append(f"I hit: {w}")
-            break
-    for w in (proto.C_syn or []) + ([proto.C] if proto.C else []):
-        if w and w.lower() in text_l:
-            hits += 1
-            reasons.append(f"C hit: {w}")
-            break
-    # RCT cue
-    if st.session_state.get("article_type") == "RCT":
-        if any(k in text_l for k in ["randomized", "randomised", "trial", "controlled"]):
-            hits += 1
-            reasons.append("Trial-like wording")
-    # Exclusion cues
-    if any(k in text_l for k in ["case report", "animal", "mice", "rat", "in vitro"]):
-        return "Exclude", "Exclusion cue in title/abstract.", 0.75
-    if hits >= 2:
-        return "Include", "; ".join(reasons) or "Keyword hits.", 0.70
-    if hits == 1:
-        return "Unsure", "; ".join(reasons) or "Partial hit; keep for full-text.", 0.55
-    return "Unsure", "No obvious hit; keep for safety (manual check).", 0.45
+    pub_l = pubtypes.lower()
+
+    # Hard exclusion cues
+    if any(k in text_l for k in ["case report", "case series", "animal", "mice", "mouse", "rat", "in vitro"]):
+        return "Exclude", "排除線索：非人體臨床研究（animal/in vitro/case report）。", 0.85
+
+    # RCT / trial cues
+    rct_pubtype = any(k in pub_l for k in ["randomized controlled trial", "controlled clinical trial"])
+    trial_like = any(k in text_l for k in ["randomized", "randomised", "randomly", "trial", "controlled", "placebo", "double-blind", "single-blind"])
+    is_rct = rct_pubtype or trial_like
+
+    # PICO matching (lightweight)
+    hits = []
+    def _hit(axis_name: str, terms: List[str]) -> bool:
+        for w in terms:
+            w0 = (w or "").strip()
+            if not w0:
+                continue
+            if w0.lower() in text_l:
+                hits.append(f"{axis_name}：{w0}")
+                return True
+        return False
+
+    _hit("I", (proto.I_syn or []) + ([proto.I] if proto.I else []))
+    _hit("C", (proto.C_syn or []) + ([proto.C] if proto.C else []))
+    _hit("P", (proto.P_syn or []) + ([proto.P] if proto.P else []))
+    _hit("O", (proto.O_syn or []) + ([proto.O] if proto.O else []))
+
+    # Article-type constraint (UI)
+    want_rct = (st.session_state.get("article_type") == "RCT")
+    if want_rct and not is_rct:
+        strict = bool(st.session_state.get("strict_rct_screen", True))
+        if strict:
+            return "Exclude", "研究設計不符合：已選 RCT，但 PublicationTypes/摘要未見隨機對照試驗線索。", 0.82
+        # non-strict: keep as Unsure if PICO strongly matches
+        if len(hits) >= 2:
+            return "Unsure", "PICO 可能符合，但未見 RCT 線索（PublicationTypes/摘要未標示隨機對照）。建議人工確認方法學。", 0.55
+        return "Exclude", "研究設計不符合：已選 RCT，但 PublicationTypes/摘要未見隨機對照試驗線索。", 0.80
+
+    # Decision thresholds
+    if len(hits) >= 2:
+        rs = "；".join(hits) if hits else "PICO 關鍵字符合。"
+        if want_rct:
+            rs += "；設計：RCT/試驗線索"
+        return "Include", rs, 0.72 if not want_rct else 0.78
+
+    if len(hits) == 1:
+        rs = "；".join(hits) if hits else "部分符合"
+        if want_rct and is_rct:
+            rs += "；設計：RCT/試驗線索"
+        return "Unsure", rs + "；資訊不足，保留至全文。", 0.55
+
+    # No clear PICO hit; keep conservative unless explicitly filtered out by RCT rule above
+    return "Unsure", "未見明確 PICO 命中；為避免漏納入，建議人工快速掃過摘要。", 0.45
 
 # =========================================================
 # Full-text utilities
 # =========================================================
 def extract_pdf_text(pdf_bytes: bytes, max_pages: int = 30) -> str:
-    if not (HAS_PYPDF2 and pdf_bytes):
-        return ""
-    try:
-        reader = PdfReader(io.BytesIO(pdf_bytes))
-        parts = []
-        for i, page in enumerate(reader.pages):
-            if i >= max_pages:
-                break
-            try:
-                parts.append(page.extract_text() or "")
-            except Exception:
-                continue
-        return "\n".join([p for p in parts if p]).strip()
-    except Exception:
+    """Best-effort PDF text extraction (no OCR by default).
+
+    Order: PyMuPDF (fitz) → pdfplumber → PyPDF2.
+    """
+    if not pdf_bytes:
         return ""
 
-# =========================================================
-# Extraction prompt builders (AI / manual guidance)
-# =========================================================
+    max_pages = max(1, int(max_pages or 30))
+
+    # 1) PyMuPDF: usually best for "real text" PDFs
+    if 'HAS_FITZ' in globals() and HAS_FITZ:
+        try:
+            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            parts = []
+            for i in range(min(len(doc), max_pages)):
+                try:
+                    parts.append(doc.load_page(i).get_text("text") or "")
+                except Exception:
+                    continue
+            text = "\n".join([p for p in parts if p]).strip()
+            if len(text) >= 200:
+                return text
+        except Exception:
+            pass
+
+    # 2) pdfplumber: sometimes better on tricky layout
+    if 'HAS_PDFPLUMBER' in globals() and HAS_PDFPLUMBER:
+        try:
+            parts = []
+            with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+                for i, page in enumerate(pdf.pages):
+                    if i >= max_pages:
+                        break
+                    try:
+                        parts.append(page.extract_text() or "")
+                    except Exception:
+                        continue
+            text = "\n".join([p for p in parts if p]).strip()
+            if len(text) >= 200:
+                return text
+        except Exception:
+            pass
+
+    # 3) PyPDF2 fallback
+    if HAS_PYPDF2:
+        try:
+            reader = PdfReader(io.BytesIO(pdf_bytes))
+            parts = []
+            for i, page in enumerate(reader.pages):
+                if i >= max_pages:
+                    break
+                try:
+                    parts.append(page.extract_text() or "")
+                except Exception:
+                    continue
+            return "\n".join([p for p in parts if p]).strip()
+        except Exception:
+            return ""
+
+    return 
 def default_extraction_schema() -> str:
-    # Not "hard-coded": this is a starting point; user can edit schema text.
+    # Starting point; user can edit schema text.
+    # Includes both effect/CI fields and arm-level fields (so MD/SE/CI can be computed).
     return "\n".join([
+        # IDs
         "StudyID",
         "PMID",
+        "DOI",
         "First_author",
         "Year",
+        "Journal",
         "Title",
+
+        # Study characteristics
+        "StudyDesign",
+        "Setting",
+        "Country",
+        "RecruitmentPeriod",
+        "FollowUp",
+        "Funding",
+        "Registration",
+
+        # Eligibility / PICO
         "Population",
+        "InclusionCriteria",
+        "ExclusionCriteria",
         "Intervention",
         "Comparator",
+
+        # Outcome
         "OutcomeLabel",
+        "OutcomeUnit",
         "Timepoint",
+
+        # Effect-size entry (preferred if reported)
         "Effect_measure",
         "Effect",
+        "SE",
         "Lower_CI",
         "Upper_CI",
+
+        # Dichotomous (optional)
         "Events_Treat",
         "Total_Treat",
         "Events_Control",
         "Total_Control",
+
+        # Continuous (optional)
         "Mean_Treat",
         "SD_Treat",
         "N_Treat",
         "Mean_Control",
         "SD_Control",
         "N_Control",
+
         "Notes",
     ])
-
 def build_data_extraction_prompt(proto: Protocol, schema_cols: List[str], full_text: str = "") -> str:
     schema = "\n".join([f"- {c}" for c in schema_cols if c.strip()])
     return f"""
@@ -1344,67 +1481,149 @@ RATIO_MEASURES = {"OR","RR","HR"}
 def se_from_ci(effect: float, lcl: float, ucl: float, measure: str) -> Optional[float]:
     if effect is None or lcl is None or ucl is None:
         return None
-    if measure in RATIO_MEASURES:
-        if effect <= 0 or lcl <= 0 or ucl <= 0:
-            return None
-        return (math.log(ucl) - math.log(lcl)) / 3.92
-    # continuous
-    return (ucl - lcl) / 3.92 if ucl is not None and lcl is not None else None
+def _effect_to_theta_se(row: pd.Series, measure: str) -> Tuple[Optional[float], Optional[float], Optional[str]]:
+    """Convert an effect with CI (or SE) into (theta, se) on the analysis scale.
+    - For OR/RR/HR: analysis scale is log(effect)
+    - For MD/SMD: analysis scale is effect itself
+    """
+    measure = (measure or "").upper().strip()
+    eff = row.get("Effect")
+    lcl = row.get("Lower_CI")
+    ucl = row.get("Upper_CI")
+    se0 = row.get("SE")
+
+    try:
+        if se0 is not None and str(se0).strip() != "":
+            se_val = float(se0)
+        else:
+            se_val = None
+    except Exception:
+        se_val = None
+
+    try:
+        eff_val = float(eff)
+        lcl_val = float(lcl) if lcl is not None and str(lcl).strip() != "" else None
+        ucl_val = float(ucl) if ucl is not None and str(ucl).strip() != "" else None
+    except Exception:
+        return None, None, "Effect/CI not numeric"
+
+    if measure in ["OR", "RR", "HR"]:
+        if eff_val <= 0 or (lcl_val is not None and lcl_val <= 0) or (ucl_val is not None and ucl_val <= 0):
+            return None, None, "Ratio measure must be > 0"
+        theta = math.log(eff_val)
+        if se_val is None:
+            if lcl_val is None or ucl_val is None:
+                return None, None, "Need CI or SE"
+            se_val = (math.log(ucl_val) - math.log(lcl_val)) / (2 * 1.96)
+        if se_val <= 0:
+            return None, None, "SE invalid"
+        return theta, se_val, None
+
+    # MD / SMD
+    theta = eff_val
+    if se_val is None:
+        if lcl_val is None or ucl_val is None:
+            return None, None, "Need CI or SE"
+        se_val = (ucl_val - lcl_val) / (2 * 1.96)
+    if se_val <= 0:
+        return None, None, "SE invalid"
+    return theta, se_val, None
+
+
+def _theta_to_effect(theta: float, se: float, measure: str) -> Tuple[float, float, float]:
+    measure = (measure or "").upper().strip()
+    if measure in ["OR", "RR", "HR"]:
+        eff = math.exp(theta)
+        lcl = math.exp(theta - 1.96 * se)
+        ucl = math.exp(theta + 1.96 * se)
+        return eff, lcl, ucl
+    eff = theta
+    lcl = theta - 1.96 * se
+    ucl = theta + 1.96 * se
+    return eff, lcl, ucl
+
+
+def _heterogeneity(rows: List[Tuple[float, float]]) -> Tuple[float, float, float, float]:
+    """Given list of (theta, var), compute Q, df, I2(%), tau2(DL)."""
+    k = len(rows)
+    if k <= 1:
+        return 0.0, max(0, k - 1), 0.0, 0.0
+    ws = [1.0 / v for _, v in rows]
+    sumw = sum(ws)
+    theta_fe = sum(w * th for (th, _), w in zip(rows, ws)) / sumw
+    Q = sum(w * ((th - theta_fe) ** 2) for (th, _), w in zip(rows, ws))
+    df = k - 1
+    I2 = 0.0
+    if Q > 0 and Q > df:
+        I2 = max(0.0, (Q - df) / Q) * 100.0
+    # DerSimonian-Laird tau2
+    c = sumw - (sum(w * w for w in ws) / sumw if sumw > 0 else 0.0)
+    tau2 = max(0.0, (Q - df) / c) if c > 0 else 0.0
+    return Q, float(df), float(I2), float(tau2)
+
 
 def fixed_effect_meta(df: pd.DataFrame, measure: str) -> Tuple[Optional[dict], pd.DataFrame]:
     """
-    df must contain Effect, Lower_CI, Upper_CI.
+    df must contain Effect + (Lower_CI, Upper_CI) or SE.
     Returns (result, skipped_df).
     """
     work = df.copy()
-    work = ensure_columns(work, ["Effect","Lower_CI","Upper_CI","StudyID","First_author","Year","Title"], default="")
-    # numeric
-    for c in ["Effect","Lower_CI","Upper_CI"]:
+    work = ensure_columns(work, ["Effect","Lower_CI","Upper_CI","SE","StudyID","First_author","Year","Title","PMID"], default="")
+    for c in ["Effect","Lower_CI","Upper_CI","SE"]:
         work[c] = pd.to_numeric(work[c], errors="coerce")
-    skipped = []
-    rows = []
 
+    rows = []
+    skipped = []
     for _, r in work.iterrows():
-        eff = r.get("Effect")
-        lcl = r.get("Lower_CI")
-        ucl = r.get("Upper_CI")
-        if pd.isna(eff) or pd.isna(lcl) or pd.isna(ucl):
-            skipped.append({**r.to_dict(), "skip_reason": "Missing Effect/CI"})
+        theta, se, err = _effect_to_theta_se(r, measure)
+        if theta is None or se is None:
+            rr = r.to_dict()
+            rr["SkipReason"] = err or "Invalid"
+            skipped.append(rr)
             continue
-        eff = float(eff); lcl = float(lcl); ucl = float(ucl)
-        se = se_from_ci(eff, lcl, ucl, measure)
-        if se is None or se <= 0 or not math.isfinite(se):
-            skipped.append({**r.to_dict(), "skip_reason": "Invalid CI for chosen measure (e.g., <=0 for ratio) or SE not finite"})
-            continue
-        # transform if ratio
-        if measure in RATIO_MEASURES:
-            theta = math.log(eff)
-        else:
-            theta = eff
-        var = se * se
-        w = 1.0 / var
-        rows.append((theta, var, w, r))
+        var = se ** 2
+        rows.append((theta, var, r.to_dict()))
 
     if not rows:
         return None, pd.DataFrame(skipped)
 
-    sumw = sum(w for _,_,w,_ in rows)
-    theta_hat = sum(w*theta for theta,_,w,_ in rows) / sumw
+    # FE pooling
+    ws = [1.0 / v for _, v, _ in rows]
+    sumw = sum(ws)
+    theta_hat = sum(w * th for (th, _, _), w in zip(rows, ws)) / sumw
     se_hat = math.sqrt(1.0 / sumw)
-    lcl_hat = theta_hat - 1.96 * se_hat
-    ucl_hat = theta_hat + 1.96 * se_hat
+    pooled, pooled_lcl, pooled_ucl = _theta_to_effect(theta_hat, se_hat, measure)
 
-    if measure in RATIO_MEASURES:
-        pooled = math.exp(theta_hat)
-        pooled_lcl = math.exp(lcl_hat)
-        pooled_ucl = math.exp(ucl_hat)
-    else:
-        pooled = theta_hat
-        pooled_lcl = lcl_hat
-        pooled_ucl = ucl_hat
+    # Heterogeneity on theta scale
+    Q, df_q, I2, tau2 = _heterogeneity([(th, v) for th, v, _ in rows])
+    pQ = None
+    if 'HAS_SCIPY' in globals() and HAS_SCIPY and df_q > 0:
+        try:
+            pQ = float(chi2.sf(Q, df_q))
+        except Exception:
+            pQ = None
+
+    # per-study table on effect scale
+    out = []
+    for (th, v, rd), w in zip(rows, ws):
+        se = math.sqrt(v)
+        eff, lcl, ucl = _theta_to_effect(th, se, measure)
+        out.append({
+            "PMID": str(rd.get("PMID","")),
+            "StudyID": str(rd.get("StudyID","")),
+            "First_author": rd.get("First_author",""),
+            "Year": rd.get("Year",""),
+            "Title": rd.get("Title",""),
+            "Effect": float(eff),
+            "Lower_CI": float(lcl),
+            "Upper_CI": float(ucl),
+            "Weight": float(w),
+        })
+    tab = pd.DataFrame(out)
+    tab["Weight_pct"] = tab["Weight"] / tab["Weight"].sum() * 100.0
 
     result = {
-        "measure": measure,
+        "measure": measure.upper().strip(),
         "model": "Fixed effect",
         "k": len(rows),
         "pooled": pooled,
@@ -1412,121 +1631,323 @@ def fixed_effect_meta(df: pd.DataFrame, measure: str) -> Tuple[Optional[dict], p
         "pooled_ucl": pooled_ucl,
         "theta_hat": theta_hat,
         "se_hat": se_hat,
+        "Q": Q,
+        "df": df_q,
+        "p_Q": pQ,
+        "I2": I2,
+        "tau2": tau2,
+        "study_table": tab.sort_values("Weight", ascending=True).reset_index(drop=True),
     }
-    # Add per-study weights
-    out_rows = []
-    for theta, var, w, r in rows:
-        weight = w / sumw
-        out_rows.append({
-            "StudyID": r.get("StudyID",""),
-            "First_author": r.get("First_author",""),
-            "Year": r.get("Year",""),
-            "Title": r.get("Title",""),
-            "Effect": float(r.get("Effect")),
-            "Lower_CI": float(r.get("Lower_CI")),
-            "Upper_CI": float(r.get("Upper_CI")),
-            "Weight": weight,
+    return result, pd.DataFrame(skipped)
+
+
+def random_effect_meta(df: pd.DataFrame, measure: str) -> Tuple[Optional[dict], pd.DataFrame]:
+    """DerSimonian-Laird random-effects meta-analysis."""
+    work = df.copy()
+    work = ensure_columns(work, ["Effect","Lower_CI","Upper_CI","SE","StudyID","First_author","Year","Title","PMID"], default="")
+    for c in ["Effect","Lower_CI","Upper_CI","SE"]:
+        work[c] = pd.to_numeric(work[c], errors="coerce")
+
+    rows = []
+    skipped = []
+    for _, r in work.iterrows():
+        theta, se, err = _effect_to_theta_se(r, measure)
+        if theta is None or se is None:
+            rr = r.to_dict()
+            rr["SkipReason"] = err or "Invalid"
+            skipped.append(rr)
+            continue
+        var = se ** 2
+        rows.append((theta, var, r.to_dict()))
+
+    if not rows:
+        return None, pd.DataFrame(skipped)
+
+    Q, df_q, I2, tau2 = _heterogeneity([(th, v) for th, v, _ in rows])
+    pQ = None
+    if 'HAS_SCIPY' in globals() and HAS_SCIPY and df_q > 0:
+        try:
+            pQ = float(chi2.sf(Q, df_q))
+        except Exception:
+            pQ = None
+
+    # RE pooling
+    ws = [1.0 / (v + tau2) for _, v, _ in rows]
+    sumw = sum(ws)
+    theta_hat = sum(w * th for (th, _, _), w in zip(rows, ws)) / sumw
+    se_hat = math.sqrt(1.0 / sumw)
+    pooled, pooled_lcl, pooled_ucl = _theta_to_effect(theta_hat, se_hat, measure)
+
+    out = []
+    for (th, v, rd), w in zip(rows, ws):
+        se = math.sqrt(v)
+        eff, lcl, ucl = _theta_to_effect(th, se, measure)
+        out.append({
+            "PMID": str(rd.get("PMID","")),
+            "StudyID": str(rd.get("StudyID","")),
+            "First_author": rd.get("First_author",""),
+            "Year": rd.get("Year",""),
+            "Title": rd.get("Title",""),
+            "Effect": float(eff),
+            "Lower_CI": float(lcl),
+            "Upper_CI": float(ucl),
+            "Weight": float(w),
         })
-    result["study_table"] = pd.DataFrame(out_rows)
+    tab = pd.DataFrame(out)
+    tab["Weight_pct"] = tab["Weight"] / tab["Weight"].sum() * 100.0
+
+    result = {
+        "measure": measure.upper().strip(),
+        "model": "Random effects (DL)",
+        "k": len(rows),
+        "pooled": pooled,
+        "pooled_lcl": pooled_lcl,
+        "pooled_ucl": pooled_ucl,
+        "theta_hat": theta_hat,
+        "se_hat": se_hat,
+        "Q": Q,
+        "df": df_q,
+        "p_Q": pQ,
+        "I2": I2,
+        "tau2": tau2,
+        "study_table": tab.sort_values("Weight", ascending=True).reset_index(drop=True),
+    }
     return result, pd.DataFrame(skipped)
 
 def plot_forest(result: dict, title: str = ""):
     df = result.get("study_table")
-    if df is None or df.empty:
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         st.info("沒有可畫的列。")
         return
 
-    # sort by weight (largest at top)
     dfp = df.copy()
-    dfp["Weight_pct"] = (dfp["Weight"]*100).round(1)
-    dfp = dfp.sort_values("Weight", ascending=True)
+    dfp = ensure_columns(dfp, ["First_author","Year","Effect","Lower_CI","Upper_CI","Weight_pct","Title"], default="")
+    dfp["StudyLabel"] = [
+        f"{str(a).strip()} {str(y).strip()}".strip()
+        for a, y in zip(dfp["First_author"].astype(str), dfp["Year"].astype(str))
+    ]
+    dfp = dfp.sort_values("Weight_pct", ascending=True).reset_index(drop=True)
 
-    pooled = result["pooled"]; pooled_lcl = result["pooled_lcl"]; pooled_ucl = result["pooled_ucl"]
-    measure = result["measure"]
+    pooled = float(result.get("pooled"))
+    pooled_lcl = float(result.get("pooled_lcl"))
+    pooled_ucl = float(result.get("pooled_ucl"))
+    measure = str(result.get("measure","")).upper().strip()
+    model = str(result.get("model",""))
 
-    if HAS_PLOTLY:
-        y = [f"{a} {y}".strip() for a,y in zip(dfp["First_author"].astype(str), dfp["Year"].astype(str))]
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=dfp["Effect"], y=y, mode="markers",
-            marker=dict(size=(dfp["Weight_pct"].clip(lower=2, upper=18))),
-            error_x=dict(type="data", symmetric=False,
-                         array=(dfp["Upper_CI"]-dfp["Effect"]),
-                         arrayminus=(dfp["Effect"]-dfp["Lower_CI"])),
-            name="Studies"
-        ))
-        # pooled as diamond-ish: use thick line
-        fig.add_trace(go.Scatter(
-            x=[pooled_lcl, pooled, pooled_ucl], y=["Pooled"]*3, mode="lines+markers",
-            line=dict(width=6),
-            marker=dict(size=8),
-            name="Pooled"
-        ))
-        fig.update_layout(
-            title=title or f"Forest plot ({measure}, fixed effect)",
-            xaxis_title=measure,
-            yaxis_title="Study",
-            height=max(380, 45*(len(dfp)+2)),
-            margin=dict(l=20,r=20,t=50,b=20),
-        )
-        st.plotly_chart(fig, use_container_width=True)
-    elif HAS_MPL:
-        # Simple matplotlib forest
-        y_pos = list(range(len(dfp)))
-        labels = [f"{a} {y}".strip() for a,y in zip(dfp["First_author"].astype(str), dfp["Year"].astype(str))]
-        fig, ax = plt.subplots(figsize=(8, max(3.8, 0.35*(len(dfp)+2))))
-        ax.errorbar(dfp["Effect"], y_pos, xerr=[dfp["Effect"]-dfp["Lower_CI"], dfp["Upper_CI"]-dfp["Effect"]], fmt="o")
-        ax.axvline(pooled, linestyle="--")
-        ax.set_yticks(y_pos)
-        ax.set_yticklabels(labels)
-        ax.set_xlabel(measure)
-        ax.set_title(title or f"Forest plot ({measure}, fixed effect)")
-        st.pyplot(fig)
+    ratio = measure in ["OR","RR","HR"]
+    null = 1.0 if ratio else 0.0
+
+    # axis limits
+    xmin = float(dfp["Lower_CI"].min())
+    xmax = float(dfp["Upper_CI"].max())
+    xmin = min(xmin, pooled_lcl)
+    xmax = max(xmax, pooled_ucl)
+    if ratio:
+        xmin = max(1e-4, xmin)
+        xmax = max(xmin * 1.2, xmax)
+        xmin = xmin / 1.3
+        xmax = xmax * 1.3
     else:
-        st.info("環境缺少 Plotly / matplotlib：改以表格顯示森林圖資料。")
-        st.dataframe(dfp[["First_author","Year","Effect","Lower_CI","Upper_CI","Weight_pct"]], use_container_width=True)
+        pad = (xmax - xmin) * 0.18 if xmax > xmin else 1.0
+        xmin -= pad
+        xmax += pad
 
-# =========================================================
-# Manuscript draft
-# =========================================================
+    # layout
+    k = dfp.shape[0]
+    y = list(range(k))
+    y_sum = k  # summary at bottom
+
+    fig_h = max(3.6, 0.36 * (k + 3))
+    fig, ax = plt.subplots(figsize=(9.6, fig_h))
+
+    # plot CIs
+    for i, row in dfp.iterrows():
+        yi = y[i]
+        eff = float(row["Effect"])
+        lcl = float(row["Lower_CI"])
+        ucl = float(row["Upper_CI"])
+        wt = float(row.get("Weight_pct", 0.0))
+        # CI line
+        ax.plot([lcl, ucl], [yi, yi], lw=1.6)
+        # square size proportional to weight
+        ms = max(4.0, min(12.0, 4.0 + wt / 4.0))
+        ax.plot([eff], [yi], marker="s", markersize=ms, linestyle="None")
+
+    # pooled diamond
+    dh = 0.28
+    ax.fill([pooled_lcl, pooled, pooled_ucl, pooled], [y_sum, y_sum - dh, y_sum, y_sum + dh], alpha=0.35, edgecolor="black")
+    ax.plot([pooled_lcl, pooled_ucl], [y_sum, y_sum], lw=1.0)
+
+    # reference line
+    ax.axvline(null, linestyle="--", lw=1.0)
+
+    ax.set_ylim(-1, y_sum + 1)
+    ax.set_yticks([])
+    ax.set_xlim(xmin, xmax)
+    if ratio:
+        ax.set_xscale("log")
+    ax.set_xlabel(f"{measure}")
+    ax.set_title(title or f"Forest plot ({measure}, {model})")
+
+    # text columns (RevMan-like)
+    # Left: study labels; Right: effect (CI) and weight
+    left_x = 0.02
+    eff_x = 0.68
+    wt_x = 0.92
+
+    fig.text(left_x, 0.93, "Study or Subgroup", fontweight="bold")
+    fig.text(eff_x, 0.93, f"{measure} (95% CI)", fontweight="bold")
+    fig.text(wt_x, 0.93, "Weight", fontweight="bold", ha="right")
+
+    # map y data to figure coordinates
+    def _y_to_fig(yi: float) -> float:
+        # convert axis data y to figure coordinate
+        return ax.transData.transform((null, yi))[1] / fig.bbox.height
+
+    for i, row in dfp.iterrows():
+        yi = y[i]
+        yf = _y_to_fig(yi)
+        fig.text(left_x, yf, str(row["StudyLabel"])[:60])
+        eff = float(row["Effect"]); lcl = float(row["Lower_CI"]); ucl = float(row["Upper_CI"])
+        fig.text(eff_x, yf, f"{eff:.3g} [{lcl:.3g}, {ucl:.3g}]")
+        fig.text(wt_x, yf, f"{float(row.get('Weight_pct',0.0)):.1f}%", ha="right")
+
+    yf = _y_to_fig(y_sum)
+    fig.text(left_x, yf, "Total (95% CI)", fontweight="bold")
+    fig.text(eff_x, yf, f"{pooled:.3g} [{pooled_lcl:.3g}, {pooled_ucl:.3g}]", fontweight="bold")
+    fig.text(wt_x, yf, "100.0%", fontweight="bold", ha="right")
+
+    # heterogeneity footer
+    Q = result.get("Q"); df_q = result.get("df"); pQ = result.get("p_Q"); I2 = result.get("I2"); tau2 = result.get("tau2")
+    het = []
+    if Q is not None and df_q is not None:
+        if pQ is None:
+            het.append(f"Chi²={Q:.2f}, df={int(df_q)}")
+        else:
+            het.append(f"Chi²={Q:.2f}, df={int(df_q)}, p={pQ:.3g}")
+    if I2 is not None:
+        het.append(f"I²={float(I2):.1f}%")
+    if model.lower().startswith("random") and tau2 is not None:
+        het.append(f"Tau²={float(tau2):.3g}")
+    if het:
+        fig.text(0.02, 0.03, "Heterogeneity: " + "; ".join(het))
+
+    st.pyplot(fig, use_container_width=True)
+def plot_rob2_traffic_light(rob2_map: Dict[str, dict], pmids: List[str], title: str = "RoB 2.0 traffic light"):
+    """Simple RoB 2.0 traffic-light plot (RevMan-like)."""
+    if not pmids:
+        st.info("沒有可畫的研究。")
+        return
+    domains = list(ROB_DOMAINS) + ["Overall"]
+    levels = {"Low": 0, "Some concerns": 1, "High": 2, "Unclear": 3}
+    # Colors are not explicitly set elsewhere; for clarity here we set typical traffic-light colors.
+    color_map = {
+        "Low": "#2ecc71",
+        "Some concerns": "#f1c40f",
+        "High": "#e74c3c",
+        "Unclear": "#bdc3c7",
+    }
+
+    data = []
+    for pmid in pmids:
+        r = (rob2_map or {}).get(pmid, {}) or {}
+        row = []
+        for d in domains:
+            v = r.get(d, "Unclear")
+            if v not in levels:
+                v = "Unclear"
+            row.append(v)
+        data.append(row)
+
+    k = len(pmids)
+    fig_w = max(7.5, 0.75 * len(domains) + 2.0)
+    fig_h = max(2.8, 0.36 * (k + 3))
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+
+    ax.set_xlim(0, len(domains))
+    ax.set_ylim(0, k)
+    ax.invert_yaxis()
+
+    for i in range(k):
+        for j, d in enumerate(domains):
+            v = data[i][j]
+            rect = plt.Rectangle((j, i), 1, 1, facecolor=color_map.get(v, "#bdc3c7"), edgecolor="white", lw=1)
+            ax.add_patch(rect)
+
+    ax.set_xticks([j + 0.5 for j in range(len(domains))])
+    ax.set_xticklabels(domains, rotation=30, ha="right")
+    ax.set_yticks([i + 0.5 for i in range(k)])
+    ax.set_yticklabels([str(p) for p in pmids])
+    ax.set_title(title)
+    ax.set_frame_on(False)
+
+    # Legend
+    handles = [plt.Rectangle((0, 0), 1, 1, color=color_map[k]) for k in ["Low", "Some concerns", "High", "Unclear"]]
+    ax.legend(handles, ["Low", "Some concerns", "High", "Unclear"], loc="upper right", frameon=False)
+
+    st.pyplot(fig, use_container_width=True)
+
 def generate_manuscript_basic(proto: Protocol, prisma: dict, ma_result: Optional[dict]) -> Dict[str, str]:
-    """
-    English IMRaD baseline, with placeholders 『』 for missing.
-    """
+    """IMRaD baseline draft with placeholders 『』 for missing items."""
     topic = st.session_state.get("question_en") or st.session_state.get("question") or ""
-    k = ma_result["k"] if ma_result else 0
-    pooled = ""
+    topic = topic.strip() if topic else "『research question』"
+
+    # PRISMA counts
+    n_id = prisma.get("identified", "『』")
+    n_scr = prisma.get("screened", "『』")
+    n_ft = prisma.get("fulltext_assessed", "『』")
+    n_inc = prisma.get("included", "『』")
+
+    # MA stats
+    ma_txt = "『meta-analysis summary』"
     if ma_result:
-        pooled = f"{ma_result['pooled']:.3g} (95% CI {ma_result['pooled_lcl']:.3g} to {ma_result['pooled_ucl']:.3g})"
-    else:
-        pooled = "『pooled estimate (95% CI)』"
+        pooled = ma_result.get("pooled")
+        lcl = ma_result.get("pooled_lcl")
+        ucl = ma_result.get("pooled_ucl")
+        k = ma_result.get("k", 0)
+        model = ma_result.get("model","Fixed effect")
+        measure = ma_result.get("measure","")
+        I2 = ma_result.get("I2", 0)
+        try:
+            ma_txt = f"{model} pooled {measure}={float(pooled):.3g} (95% CI {float(lcl):.3g}–{float(ucl):.3g}); k={k}; I²={float(I2):.1f}%"
+        except Exception:
+            pass
 
     intro = f"""Introduction
-We conducted a systematic review and meta-analysis to address the following clinical question: {topic}.
-The rationale was to synthesize comparative evidence and to identify gaps for future research.
+Rationale: Evidence on {topic} remains heterogeneous and requires quantitative synthesis to inform practice and future research.
+Objective: To systematically review and meta-analyze comparative studies addressing {topic}.
 """.strip()
 
     methods = f"""Methods
-Protocol and eligibility criteria: We defined the research question using PICO (Population, Intervention, Comparator, Outcome). Eligibility criteria were refined after a feasibility scan of existing SR/MA/NMA evidence, prioritizing {proto.goal_mode}.
-Information sources and search strategy: We searched PubMed using a strategy combining MeSH terms and free-text keywords (see Step 1 for the full query). The search was last updated on 『date』.
-Study selection: Title/abstract screening and full-text review were performed with AI-assisted suggestions and investigator overrides. Reasons for full-text exclusion were recorded.
-Data extraction: We used a wide-table extraction sheet at the PICO level. Where necessary, OCR and figure/table cues were used to improve extraction from PDFs.
-Risk of bias: Risk of Bias 2.0 domains (randomization, deviations, missing data, outcome measurement, selective reporting) were assessed with rationale.
-Synthesis: We performed a fixed-effect meta-analysis using inverse-variance weighting. Effect measures included {ma_result['measure'] if ma_result else '『OR/RR/HR/MD/SMD』'}.
+Protocol and reporting: This review followed PRISMA guidance. The protocol specified eligibility criteria, outcomes, and analytic methods. 『protocol registration/ID if applicable』
+Eligibility criteria: Population={proto.P or '『』'}; Intervention={proto.I or '『』'}; Comparator={proto.C or '『』'}; Outcomes={proto.O or '『』'}. Study design constraints: {st.session_state.get('article_type','不限')}.
+Information sources and search strategy: We searched PubMed using a strategy combining MeSH and free-text terms (see Step 1 for the full query). Additional sources included reference lists and related-citation screening as feasible. 『date of last search』
+Study selection: Two reviewers (『names/roles』) screened titles/abstracts, followed by full-text assessment; disagreements were resolved by consensus/third reviewer. Screening counts: identified={n_id}, screened={n_scr}, full-text assessed={n_ft}, included={n_inc}.
+Data extraction: We extracted study characteristics, PICO details, and effect estimates (with variance). When needed, effect sizes were derived from arm-level data. 『software/tools』
+Risk of bias: We assessed risk of bias using RoB 2.0 for randomized trials, including domain-level judgments and overall risk.
+Synthesis: Meta-analyses used inverse-variance weighting with fixed-effect and/or random-effects (DerSimonian–Laird) models as specified. Heterogeneity was quantified using Chi² (Q) and I² statistics.
 """.strip()
 
     results = f"""Results
-Search results: We retrieved {prisma.get('records_identified', '『n』')} records from PubMed. After screening, {prisma.get('studies_included_ma', '『n』')} studies were included for quantitative synthesis.
-Main findings: The pooled effect was {pooled} based on {k} comparisons. 『Add key secondary outcomes / subgroup results if available』.
+Study selection: We identified {n_id} records. After screening {n_scr} titles/abstracts, {n_ft} full texts were assessed and {n_inc} studies were included in quantitative synthesis.
+Study characteristics: Included studies were published in 『years range』 and evaluated {proto.I or '『intervention』'} versus {proto.C or '『comparator』'} in {proto.P or '『population』'}. 『add key baseline characteristics and follow-up』
+Risk of bias: Overall RoB 2.0 judgments were 『summary of Low/Some concerns/High』 with common issues in 『domains』.
+Quantitative synthesis: {ma_txt}. 『subgroup/sensitivity analyses if applicable』
 """.strip()
 
     discussion = f"""Discussion
-This meta-analysis summarizes comparative evidence for {topic}. The pooled estimate suggests 『interpretation』. Key limitations include potential heterogeneity in study design, outcome definitions, and reporting, as well as limitations of AI-assisted extraction that required manual verification.
-Future directions: Further randomized trials and standardized outcome reporting may strengthen the evidence base. 『Add specific recommendations』.
+Principal findings: This synthesis suggests that {proto.I or 'the intervention'} compared with {proto.C or 'the comparator'} is associated with 『direction/magnitude』 for {proto.O or 'the outcome'}.
+Interpretation: Findings should be interpreted considering heterogeneity (I²) and risk of bias. 『clinical relevance』
+Limitations: Potential limitations include database restriction to PubMed, incomplete reporting in primary studies, and residual heterogeneity. 『publication bias/short follow-up』
+Implications: Future trials should standardize outcomes and report arm-level data to enable robust meta-analysis.
 """.strip()
 
-    return {"Introduction": intro, "Methods": methods, "Results": results, "Discussion": discussion}
-
+    return {
+        "Introduction": intro,
+        "Methods": methods,
+        "Results": results,
+        "Discussion": discussion,
+    }
 def manuscript_llm_enhance(proto: Protocol, prisma: dict, ma_result: Optional[dict], style_notes: str) -> Optional[Dict[str, str]]:
     if not llm_available():
         return None
@@ -1714,7 +2135,17 @@ def run_pipeline():
                 "and provide a 1-2 sentence rationale and a confidence 0-1. "
                 "Do not fabricate. Return STRICT JSON: {pmid: {label, reason, confidence}}."
             )
-            user = json.dumps({"PICO": proto.to_dict().get("pico"), "records": payload}, ensure_ascii=False)
+            user = json.dumps({
+                "language": st.session_state.get("UI_LANG","zh-TW"),
+                "constraints": {
+                    "article_type": st.session_state.get("article_type","不限"),
+                    "custom_pubmed_filter": st.session_state.get("custom_pubmed_filter",""),
+                    "goal_mode": proto.goal_mode,
+                    "strict_rct_screen": bool(st.session_state.get("strict_rct_screen", True)),
+                },
+                "PICO": proto.to_dict().get("pico"),
+                "records": payload,
+            }, ensure_ascii=False)
             d = llm_json(sys, user, max_tokens=1700) or {}
             for rec in payload:
                 pmid = str(rec.get("PMID",""))
@@ -1820,17 +2251,24 @@ def compute_ta_suggestions(proto: Protocol, df: pd.DataFrame):
             "Title": str(r.get("Title","") or ""),
             "Abstract": str(r.get("Abstract","") or "")[:3500],
             "Year": str(r.get("Year","") or ""),
-            "FirstAuthor": str(r.get("FirstAuthor","") or ""),
+            "FirstAuthor": str(r.get("First_author","") or r.get("FirstAuthor","") or ""),
             "Journal": str(r.get("Journal","") or ""),
+            "PublicationTypes": str(r.get("PublicationTypes","") or ""),
         })
 
     if _llm_enabled():
         try:
             sys = (
-                "You are screening PubMed records for a systematic review/meta-analysis. "
-                "Given PICO and a list of records, label each record as Include/Exclude/Unsure for FULL-TEXT review, "
-                "and provide a concise rationale and a confidence 0-1. "
-                "Do not fabricate. Return STRICT JSON: {pmid: {label, reason, confidence}}."
+                "You are performing title/abstract screening for an evidence synthesis. "
+                "Given (a) PICO, (b) constraints, and (c) a list of PubMed records, you must label EACH record as "
+                "Include / Exclude / Unsure for FULL-TEXT review. "
+                "Be conservative (prefer Unsure over wrong Exclude) unless a constraint is clearly violated. "
+                "For the rationale, write 1–3 short bullet points that are audit-friendly: "
+                "(1) which PICO elements match (mention exact terms found), "
+                "(2) study design check (e.g., RCT yes/no and why; refer to PublicationTypes/title/abstract cues), "
+                "(3) any hard exclusion reason if applicable. "
+                "Return STRICT JSON only with schema: {pmid: {label: str, confidence: float, reason: str}}. "
+                "Do not invent data not present in the record."
             )
             user = json.dumps({"PICO": proto.to_dict().get("pico"), "records": payload}, ensure_ascii=False)
             d = llm_json(sys, user, max_tokens=1700) or {}
@@ -1982,6 +2420,12 @@ with tabs[1]:
 # =========================================================
 # Tab 2: Feasibility scan + recommendations
 # =========================================================
+    st.markdown("---")
+    st.markdown("### PRISMA（即時總覽）")
+    prisma_now = compute_prisma(st.session_state.get("pubmed_records"))
+    prisma_flow(prisma_now)
+    st.caption("此 PRISMA 會隨 Step 3/4 初篩、Step 4b 全文決策、Step 5/6 的更新而自動變化。若你在 Step 1 手改搜尋式，請記得按 Refetch 重新抓 records。")
+
 with tabs[2]:
     st.subheader(t("feas_title"))
     hits = st.session_state.get("srma_hits")
@@ -2037,6 +2481,7 @@ with tabs[2]:
 # =========================================================
 # Tab 3: Step 3+4 - Records + screening (merged)
 # =========================================================
+
 with tabs[3]:
     st.subheader(t("tabs_step34"))
     df = st.session_state.get("pubmed_records")
@@ -2050,48 +2495,112 @@ with tabs[3]:
             ["PMID", "Title", "Abstract", "Year", "First_author", "Journal", "DOI", "PMCID", "PublicationTypes"],
             default="",
         )
-        st.caption("每篇文獻含：PMID/DOI/Year/First author/Journal、PubMed/DOI/PMC/學院全文(OpenURL/EZproxy)、AI 建議與信心度、以及人工 override（可稽核）。")
 
-        # Bulk tools
-        c1, c2, c3, c4 = st.columns([1, 1, 1.1, 2.2])
+        st.caption(
+            "此步驟是『初篩（Title/Abstract）』：AI 只是在旁邊提供建議與理由，最終納入/排除以你在此步驟的決策為準。"
+            "若已在 Settings 選擇文章類型（如 RCT），AI/規則會把『不符合設計』的研究優先標示為 Exclude。"
+        )
+
+        st.session_state.setdefault("view_mode_step34", "卡片")
+        st.session_state.setdefault("strict_rct_screen", True)
+
+        # Bulk / utilities
+        c1, c2, c3, c4, c5 = st.columns([1.35, 1.2, 1.0, 1.15, 2.3])
         with c1:
+            if st.button("重新計算 AI 初篩建議（依最新 PICO/限制）"):
+                proto = st.session_state.get("protocol")
+                if proto and isinstance(proto, Protocol):
+                    compute_ta_suggestions(proto, df)
+                    st.success("已更新 AI 建議。")
+        with c2:
             if st.button("Override all Unsure → Include"):
                 for pmid in df["PMID"].astype(str).tolist():
                     if st.session_state.get("ta_ai", {}).get(pmid, "Unsure") == "Unsure":
                         st.session_state["ta_override"][pmid] = "Include"
                         st.session_state["ta_override_reason"][pmid] = "Batch override: keep for full text."
-        with c2:
+        with c3:
             if st.button("Clear all overrides"):
                 st.session_state["ta_override"] = {}
                 st.session_state["ta_override_reason"] = {}
-        with c3:
-            view_mode = st.radio("顯示方式", options=["卡片", "表格（精簡）"], horizontal=True, index=0, key="view_mode_step34")
         with c4:
-            st.write("")
+            st.session_state["strict_rct_screen"] = st.checkbox(
+                "嚴格依 RCT 篩（已選 RCT 時）",
+                value=bool(st.session_state.get("strict_rct_screen", True)),
+                help="開啟時：若已選 RCT，且摘要/PublicationTypes 無 RCT 線索，會更傾向 Exclude。",
+            )
+        with c5:
+            view_mode = st.radio(
+                "顯示方式",
+                options=["卡片", "表格（精簡，可改 Include/Exclude）"],
+                horizontal=True,
+                index=0 if st.session_state.get("view_mode_step34", "卡片") == "卡片" else 1,
+                key="view_mode_step34",
+            )
 
+        def _final_label(pmid: str) -> str:
+            ov = (st.session_state.get("ta_override", {}) or {}).get(pmid, "")
+            if ov:
+                return ov
+            return (st.session_state.get("ta_ai", {}) or {}).get(pmid, "Unsure") or "Unsure"
+
+        # Table view (editable)
         show_cards = (st.session_state.get("view_mode_step34", "卡片") == "卡片")
-
         if not show_cards:
-            view = df[["PMID", "Year", "First_author", "Journal", "Title"]].copy()
-            view["AI_suggest"] = [st.session_state.get("ta_ai", {}).get(str(p), "") for p in view["PMID"].astype(str)]
-            view["Final"] = [
-                (st.session_state.get("ta_override", {}).get(str(p), "") or st.session_state.get("ta_ai", {}).get(str(p), ""))
-                for p in view["PMID"].astype(str)
-            ]
-            st.dataframe(view, use_container_width=True, hide_index=True)
+            view = df[["PMID", "Year", "First_author", "Journal", "PublicationTypes", "Title"]].copy()
+            view["AI_suggest"] = [st.session_state.get("ta_ai", {}).get(str(p), "Unsure") for p in view["PMID"].astype(str)]
+            view["AI_conf"] = [float(st.session_state.get("ta_ai_conf", {}).get(str(p), 0.5) or 0.5) for p in view["PMID"].astype(str)]
+            view["AI_reason"] = [st.session_state.get("ta_ai_reason", {}).get(str(p), "") for p in view["PMID"].astype(str)]
+            view["Final"] = [_final_label(str(p)) for p in view["PMID"].astype(str)]
+            view["Override_reason"] = [st.session_state.get("ta_override_reason", {}).get(str(p), "") for p in view["PMID"].astype(str)]
+
+            edited = st.data_editor(
+                view,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Final": st.column_config.SelectboxColumn(
+                        "Final (你決定)",
+                        options=["Include", "Unsure", "Exclude"],
+                        required=True,
+                    ),
+                    "AI_conf": st.column_config.NumberColumn("AI_conf", format="%.2f"),
+                    "AI_reason": st.column_config.TextColumn("AI_reason", width="large"),
+                    "Override_reason": st.column_config.TextColumn("Override_reason（可留空）", width="large"),
+                },
+                disabled=["AI_suggest", "AI_conf", "AI_reason"],
+            )
+
+            cA, cB = st.columns([1, 3])
+            with cA:
+                if st.button("套用表格修改", type="primary"):
+                    ta_ai = st.session_state.get("ta_ai", {}) or {}
+                    for _, r in edited.iterrows():
+                        pmid = str(r.get("PMID",""))
+                        final = str(r.get("Final","Unsure")).strip() or "Unsure"
+                        or_reason = str(r.get("Override_reason","") or "").strip()
+                        ai0 = ta_ai.get(pmid, "Unsure") or "Unsure"
+
+                        if final == ai0 and not or_reason:
+                            # identical to AI, drop override to keep state clean
+                            st.session_state["ta_override"].pop(pmid, None)
+                            st.session_state["ta_override_reason"].pop(pmid, None)
+                        else:
+                            st.session_state["ta_override"][pmid] = final
+                            if or_reason:
+                                st.session_state["ta_override_reason"][pmid] = or_reason
+                            else:
+                                st.session_state["ta_override_reason"][pmid] = f"Override: set to {final} in table."
+                    st.success("已更新初篩決策（Final）。PRISMA/全文階段會自動跟著變化。")
+            with cB:
+                # Summary counts
+                counts = {"Include": 0, "Unsure": 0, "Exclude": 0}
+                for pmid in df["PMID"].astype(str).tolist():
+                    counts[_final_label(pmid)] = counts.get(_final_label(pmid), 0) + 1
+                st.caption(f"目前 Final：Include {counts.get('Include',0)}｜Unsure {counts.get('Unsure',0)}｜Exclude {counts.get('Exclude',0)}")
+
+        # Card view (grouped)
         else:
-            # 分區顯示：依「AI 建議」自動分成 Include / Unsure / Exclude，方便快速瀏覽
-            groups = {"Include": [], "Unsure": [], "Exclude": []}
-            for _, r in df.iterrows():
-                pmid0 = str(r.get("PMID", "") or "").strip()
-                ai0 = (st.session_state.get("ta_ai", {}) or {}).get(pmid0, "Unsure") or "Unsure"
-                if ai0 not in groups:
-                    ai0 = "Unsure"
-                groups[ai0].append(r)
-
-
             def badge_html(label: str) -> str:
-                """Small colored badge used in Step 3+4 grouping."""
                 label = (label or "").strip()
                 styles = {
                     "Include": ("#0f5132", "#d1e7dd"),
@@ -2099,7 +2608,17 @@ with tabs[3]:
                     "Exclude": ("#842029", "#f8d7da"),
                 }
                 fg, bg = styles.get(label, ("#1f2328", "#e9ecef"))
-                return f"<span style='display:inline-block;padding:2px 8px;border-radius:999px;font-size:0.85rem;font-weight:600;color:{fg};background:{bg};border:1px solid rgba(0,0,0,0.08)'> {label} </span>"
+                return f"<span style='display:inline-block;padding:2px 8px;border-radius:999px;font-size:.85rem;font-weight:600;color:{fg};background:{bg};border:1px solid rgba(0,0,0,0.08)'> {label} </span>"
+
+            # Build groups by FINAL label (override takes precedence)
+            groups: Dict[str, List[dict]] = {"Include": [], "Unsure": [], "Exclude": []}
+            for _, r in df.iterrows():
+                pmid = str(r.get("PMID","") or "")
+                lbl = _final_label(pmid)
+                if lbl not in groups:
+                    lbl = "Unsure"
+                groups[lbl].append(r.to_dict())
+
             def render_record_card(r):
                 pmid = str(r.get("PMID", "") or "").strip()
                 title = str(r.get("Title", "") or "").strip()
@@ -2129,6 +2648,8 @@ with tabs[3]:
                     meta = f"PMID: {pmid or '—'}　|　DOI: {doi or '—'}　|　Year: {year or '—'}　|　First author: {fa or '—'}　|　Journal: {journal or '—'}"
                     st.markdown(f"**{title or '—'}**")
                     st.markdown(f"<div class='small'>{meta}</div>", unsafe_allow_html=True)
+                    if pubtypes:
+                        st.markdown(f"<div class='small'>PublicationTypes: {html.escape(pubtypes)}</div>", unsafe_allow_html=True)
 
                     links = []
                     if pubmed_link(pmid):
@@ -2137,54 +2658,43 @@ with tabs[3]:
                         links.append(f"[DOI]({maybe_ezproxy(doi_link(doi))})")
                     if pmcid:
                         links.append(f"[PMC]({maybe_ezproxy(pmc_link(pmcid))})")
+                    if resolver_url(doi, pmid):
+                        links.append(f"[學院全文連結]({resolver_url(doi, pmid)})")
                     if links:
                         st.markdown(" | ".join(links))
 
-                    st.markdown(
-                        f"AI 建議：{badge_html(ai_lbl)}　<span class='small'>信心度：{ai_conf:.2f}</span>",
-                        unsafe_allow_html=True,
-                    )
-                    if ai_reason:
-                        st.markdown(f"<div class='small'>理由：{html.escape(ai_reason)}</div>", unsafe_allow_html=True)
+                    st.markdown("**Abstract**")
+                    st.write(abstract if abstract else "(no abstract)")
 
-                    if pubtypes:
-                        st.markdown(f"<div class='small'>Publication type: {html.escape(pubtypes)}</div>", unsafe_allow_html=True)
+                    st.markdown("**AI 建議**")
+                    st.markdown(f"{badge_html(ai_lbl)}　信心度：{ai_conf:.2f}", unsafe_allow_html=True)
+                    st.write(ai_reason or "(no AI reason)")
 
-                    st.markdown("#### Abstract")
-                    abs_fmt = format_abstract(abstract)
-                    if abs_fmt:
-                        for para in abs_fmt.split("\n\n"):
-                            if para.strip():
-                                st.markdown(para.strip())
-                    else:
-                        st.caption("_No abstract available._")
+                    st.markdown("**Final（你決定）**")
+                    c1, c2 = st.columns([1, 2.2])
+                    with c1:
+                        picked = st.selectbox(
+                            "Final label",
+                            options=["", "Include", "Unsure", "Exclude"],
+                            index=0,
+                            key=f"ta_final_{pmid}",
+                            help="選了才會寫入 override；空白=沿用 AI。",
+                        )
+                    with c2:
+                        reason0 = st.text_input("Override reason (optional)", value=ov_reason, key=f"ta_why_{pmid}")
 
-                    st.markdown("<hr class='hr'/>", unsafe_allow_html=True)
-
-                    # Override
-                    st.markdown("#### 人工修正（override）")
-                    choice = st.radio(
-                        f"Final decision (Title/Abstract) — PMID：{pmid or '—'}",
-                        options=["(use AI)", "Include", "Exclude", "Unsure"],
-                        index=0 if not ov else ["(use AI)", "Include", "Exclude", "Unsure"].index(ov),
-                        key=f"ta_override_radio_{pmid}",
-                        horizontal=True,
-                    )
-                    if choice == "(use AI)":
-                        st.session_state["ta_override"].pop(pmid, None)
-                    else:
-                        st.session_state["ta_override"][pmid] = choice
-
-                    st.session_state["ta_override_reason"][pmid] = st.text_area(
-                        "Override reason（可留空；建議寫清楚入/排原因，方便 full text review 與 PRISMA）",
-                        value=ov_reason,
-                        key=f"ta_override_reason_{pmid}",
-                        height=85,
-                    )
+                    if st.button("套用此篇 Final", key=f"ta_apply_{pmid}", type="primary"):
+                        if picked:
+                            st.session_state["ta_override"][pmid] = picked
+                            st.session_state["ta_override_reason"][pmid] = reason0 or f"Override: {picked}"
+                        else:
+                            st.session_state["ta_override"].pop(pmid, None)
+                            st.session_state["ta_override_reason"].pop(pmid, None)
+                        st.success("已更新此篇 Final。")
 
                     st.markdown("</div>", unsafe_allow_html=True)
 
-            # Render by groups (AI suggestion)
+            # Render by groups
             for lbl in ["Include", "Unsure", "Exclude"]:
                 items = groups.get(lbl, [])
                 st.markdown(f"### {badge_html(lbl)} {lbl}（{len(items)}）", unsafe_allow_html=True)
@@ -2193,6 +2703,8 @@ with tabs[3]:
                 for r in items:
                     render_record_card(r)
 
+# Tab 4: Step 4b Full text review (decisions + reasons + PDF upload)
+# =========================================================
 # Tab 4: Step 4b Full text review (decisions + reasons + PDF upload)
 # =========================================================
 FULLTEXT_EXCLUSION_REASONS = [
@@ -2207,174 +2719,183 @@ FULLTEXT_EXCLUSION_REASONS = [
     "Other",
 ]
 
+
 with tabs[4]:
     st.subheader(t("tabs_ft"))
     df = st.session_state.get("pubmed_records")
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         st.info("請先 Run 並抓到 records。")
     else:
-        df = ensure_columns(df.copy(), ["PMID","Title","Year","First_author","Journal","DOI"], default="")
+        df = ensure_columns(df.copy(), ["PMID","Title","Year","First_author","Journal","DOI","PublicationTypes"], default="")
+
         # Show only records kept after TA (Include/Unsure)
         def final_ta(pmid: str) -> str:
             return st.session_state.get("ta_override",{}).get(pmid) or st.session_state.get("ta_ai",{}).get(pmid,"Unsure")
 
         kept = df[df["PMID"].astype(str).apply(lambda x: final_ta(str(x)) != "Exclude")].copy()
-        st.caption(f"進入全文階段的 records（Title/Abstract 未排除）：{kept.shape[0]} 篇")
-
+        st.caption(f"進入全文階段的 records（初篩未排除）：{kept.shape[0]} 篇")
         if kept.empty:
             st.info("沒有可做全文審查的 record。")
         else:
-            # Bulk upload PDFs
-            st.markdown("#### " + t("ft_bulk_upload"))
-            st.caption("注意：若為校內訂閱/付費期刊全文，請勿上傳到雲端部署（授權風險）。建議只上傳 OA/PMC 或本機版使用。")
-            uploads = st.file_uploader("Upload PDFs (multiple)", type=["pdf"], accept_multiple_files=True)
-            if uploads:
-                # naive match by PMID in filename if present
-                for up in uploads:
-                    name = up.name
-                    b = up.read()
-                    m = re.search(r"\b(\d{6,9})\b", name)
-                    if m:
-                        pmid_guess = m.group(1)
-                        st.session_state["ft_pdf"][pmid_guess] = b
+            st.session_state.setdefault("ft_decision", {})
+            st.session_state.setdefault("ft_reason", {})
+            st.session_state.setdefault("ft_pdf", {})
+            st.session_state.setdefault("ft_text", {})
 
-            st.markdown("---")
-            st.markdown("#### Full-text decisions (per record)")
+            # Bulk upload PDFs (optional)
+            with st.expander(t("ft_bulk_upload"), expanded=False):
+                st.caption("注意：若為校內訂閱/付費期刊全文，請勿上傳到雲端部署（授權風險）。建議只上傳 OA/PMC 或本機版使用。")
+                uploads = st.file_uploader("Upload PDFs (multiple)", type=["pdf"], accept_multiple_files=True)
+                if uploads:
+                    for up in uploads:
+                        name = up.name
+                        m = re.search(r"(\d{6,9})", name)
+                        if not m:
+                            continue
+                        pmid = m.group(1)
+                        st.session_state["ft_pdf"][pmid] = up.getvalue()
+                    st.success("已儲存上傳的 PDF（以檔名中的 PMID 對應）。")
 
-            for _, r in kept.iterrows():
-                pmid = str(r["PMID"])
-                title = r["Title"]; year = r["Year"]; fa = r["First_author"]; journal = r["Journal"]; doi = r["DOI"]
-                decision = st.session_state["ft_decision"].get(pmid, "Not reviewed")
-                reason = st.session_state["ft_reason"].get(pmid, "")
+            # Select one study to work on (prevents state loss / too many widgets)
+            kept["Label"] = kept.apply(lambda r: f"{r['PMID']}｜{short(str(r['Title'] or ''), 90)}", axis=1)
+            options = kept["Label"].tolist()
+            default_idx = 0
+            current = st.selectbox("目前處理的全文研究", options=options, index=default_idx, key="ft_current_pick")
+            pmid = current.split("｜")[0].strip()
 
-                with st.container():
-                    st.markdown("<div class='card'>", unsafe_allow_html=True)
-                    st.markdown(f"**{title or '—'}**")
-                    st.markdown(f"<span class='small'>PMID: {pmid} | Year: {year or '—'} | First author: {fa or '—'} | Journal: {journal or '—'}</span>", unsafe_allow_html=True)
-                    links = []
-                    if pubmed_link(pmid):
-                        links.append(f"[PubMed]({maybe_ezproxy(pubmed_link(pmid))})")
-                    if doi:
-                        links.append(f"[DOI]({maybe_ezproxy(doi_link(doi))})")
-                    if resolver_url(doi, pmid):
-                        links.append(f"[學院全文連結]({resolver_url(doi, pmid)})")
-                    if links:
-                        st.markdown(" | ".join(links))
+            rr = kept[kept["PMID"].astype(str) == pmid]
+            r0 = rr.iloc[0].to_dict() if not rr.empty else {}
+            title = str(r0.get("Title","") or "")
+            year = str(r0.get("Year","") or "")
+            fa = str(r0.get("First_author","") or "")
+            journal = str(r0.get("Journal","") or "")
+            doi = str(r0.get("DOI","") or "")
+            pubtypes = str(r0.get("PublicationTypes","") or "")
 
-                    cA, cB, cC = st.columns([1.1,1.2,1.7])
-                    with cA:
-                        decision_new = st.selectbox(
-                            "Full-text decision",
-                            options=["Not reviewed","Include for meta-analysis","Exclude"],
-                            index=["Not reviewed","Include for meta-analysis","Exclude"].index(decision) if decision in ["Not reviewed","Include for meta-analysis","Exclude"] else 0,
-                            key=f"ft_dec_{pmid}",
-                        )
-                        st.session_state["ft_decision"][pmid] = decision_new
-                    with cB:
-                        if decision_new == "Exclude":
-                            reason_new = st.selectbox("Exclusion reason", options=FULLTEXT_EXCLUSION_REASONS,
-                                                      index=(FULLTEXT_EXCLUSION_REASONS.index(reason) if reason in FULLTEXT_EXCLUSION_REASONS else 0),
-                                                      key=f"ft_reason_sel_{pmid}")
-                            reason_text = st.text_input("Reason note (optional)", value=st.session_state["ft_reason"].get(pmid,""),
-                                                        key=f"ft_reason_note_{pmid}")
-                            # store reason as selection + note if note differs
-                            final_reason = reason_new if reason_text.strip()=="" else f"{reason_new}: {reason_text.strip()}"
-                            st.session_state["ft_reason"][pmid] = final_reason
+            st.markdown("<div class='card'>", unsafe_allow_html=True)
+            st.markdown(f"**{title or '—'}**")
+            st.markdown(f"<span class='small'>PMID: {pmid} | Year: {year or '—'} | First author: {fa or '—'} | Journal: {journal or '—'}</span>", unsafe_allow_html=True)
+            if pubtypes:
+                st.markdown(f"<div class='small'>PublicationTypes: {html.escape(pubtypes)}</div>", unsafe_allow_html=True)
+
+            links = []
+            if pubmed_link(pmid):
+                links.append(f"[PubMed]({maybe_ezproxy(pubmed_link(pmid))})")
+            if doi:
+                links.append(f"[DOI]({maybe_ezproxy(doi_link(doi))})")
+            if resolver_url(doi, pmid):
+                links.append(f"[學院全文連結]({resolver_url(doi, pmid)})")
+            if links:
+                st.markdown(" | ".join(links))
+
+            # Full-text decision
+            cA, cB, cC = st.columns([1.1, 1.5, 1.4])
+            with cA:
+                decision_new = st.selectbox(
+                    "Full-text decision",
+                    options=["Not reviewed","Include for meta-analysis","Exclude"],
+                    index=["Not reviewed","Include for meta-analysis","Exclude"].index(st.session_state["ft_decision"].get(pmid, "Not reviewed")),
+                    key=f"ft_dec_{pmid}",
+                )
+            with cB:
+                reason_new = st.selectbox(
+                    "If Exclude: reason",
+                    options=[""] + FULLTEXT_EXCLUSION_REASONS,
+                    index=0,
+                    key=f"ft_reason_sel_{pmid}",
+                )
+            with cC:
+                other_reason = st.text_input("Other details (optional)", key=f"ft_reason_free_{pmid}")
+
+            if st.button("Save decision", type="primary", key=f"ft_save_{pmid}"):
+                st.session_state["ft_decision"][pmid] = decision_new
+                if decision_new == "Exclude":
+                    rr0 = reason_new or "Other"
+                    if rr0 == "Other" and other_reason.strip():
+                        rr0 = f"Other: {other_reason.strip()}"
+                    st.session_state["ft_reason"][pmid] = rr0
+                else:
+                    st.session_state["ft_reason"][pmid] = ""
+                st.success("已儲存全文決策。")
+
+            # PDF upload for this PMID
+            up_one = st.file_uploader("Upload PDF for this PMID (optional)", type=["pdf"], key=f"ft_pdf_one_{pmid}")
+            if up_one:
+                st.session_state["ft_pdf"][pmid] = up_one.getvalue()
+                st.success("已儲存此篇 PDF。")
+
+            # Extract / paste full-text
+            c1, c2 = st.columns([1, 1])
+            with c1:
+                if st.button("從 PDF 抽取文字（不含 OCR）", key=f"ft_extract_{pmid}"):
+                    pdfb = st.session_state.get("ft_pdf", {}).get(pmid)
+                    if not pdfb:
+                        st.warning("尚未有此篇 PDF。")
+                    else:
+                        txt = extract_pdf_text(pdfb, max_pages=30)
+                        if not txt.strip():
+                            st.warning("抽字結果為空。可能是掃描 PDF（需要 OCR）或版面不支援。建議先 OCR 再貼/上傳文字。")
                         else:
-                            st.session_state["ft_reason"][pmid] = ""
-                    with cC:
-                        up = st.file_uploader(t("ft_single_upload"), type=["pdf"], key=f"ft_pdf_up_{pmid}")
-                        if up is not None:
-                            st.session_state["ft_pdf"][pmid] = up.read()
-                        pdf_present = pmid in st.session_state.get("ft_pdf", {})
-                        st.caption(f"PDF: {'已上傳' if pdf_present else '未上傳'} | PyPDF2: {'Yes' if HAS_PYPDF2 else 'No'}")
+                            # only overwrite if non-empty, to avoid accidental loss
+                            st.session_state["ft_text"][pmid] = txt
+                            st.success(f"已抽取文字（長度 {len(txt)}）。")
+            with c2:
+                if st.button("清空此篇全文文字", key=f"ft_clear_{pmid}"):
+                    st.session_state["ft_text"][pmid] = ""
 
-                    # Extract / paste full text
-                    if pmid in st.session_state.get("ft_pdf", {}) and st.button(t("ft_extract_text"), key=f"ft_extract_btn_{pmid}"):
-                        txt = extract_pdf_text(st.session_state["ft_pdf"][pmid])
-                        if not txt:
-                            st.warning("抽字失敗或抽不到（可能是掃描檔需 OCR）。你可改貼文字或上傳已 OCR 的 PDF。")
-                        st.session_state["ft_text"][pmid] = txt
+            ft_text = st.session_state.get("ft_text", {}).get(pmid, "")
+            ft_text = st.text_area(t("ft_text_area"), value=ft_text, height=220, key=f"ft_text_area_{pmid}")
+            st.session_state["ft_text"][pmid] = ft_text
 
-                    ft_text = st.session_state.get("ft_text", {}).get(pmid, "")
-                    ft_text = st.text_area(t("ft_text_area"), value=ft_text, height=160, key=f"ft_text_area_{pmid}")
-                    st.session_state["ft_text"][pmid] = ft_text
+            if llm_available():
+                with st.expander("AI 閱讀回填（Step 5/ROB 2.0 會用到；請人工核對）", expanded=False):
+                    if st.button(t("ft_ai_fill"), key=f"ft_ai_btn_{pmid}", type="primary"):
+                        proto: Protocol = st.session_state.get("protocol")
+                        schema_cols = [c.strip() for c in (st.session_state.get("extract_schema_text") or default_extraction_schema()).splitlines() if c.strip()]
+                        prompt = build_data_extraction_prompt(proto, schema_cols, full_text=ft_text)
+                        sys = (
+                            "You are an evidence extraction assistant. "
+                            "Extract ONLY what is explicitly supported by the provided text. "
+                            "If a field is not reported, leave it empty. Return JSON only."
+                        )
+                        d = llm_json(sys, prompt, max_tokens=1700) or {}
+                        # store extraction into wide table (append)
+                        if isinstance(d, dict) and schema_cols:
+                            row = {c: "" for c in schema_cols}
+                            for c in schema_cols:
+                                if c in d:
+                                    row[c] = d.get(c, "")
+                            # Force IDs
+                            row["PMID"] = pmid
+                            row["First_author"] = fa
+                            row["Year"] = year
+                            row["Title"] = title
+                            row["DOI"] = doi
+                            # Append
+                            ex = st.session_state.get("extract_df")
+                            if not isinstance(ex, pd.DataFrame) or ex.empty:
+                                st.session_state["extract_df"] = pd.DataFrame([row])
+                            else:
+                                st.session_state["extract_df"] = pd.concat([ex, pd.DataFrame([row])], ignore_index=True)
+                            st.success("已把 AI 抽取結果追加到 Step 5 寬表（可再人工修正）。")
+                        else:
+                            st.warning("AI 回填未產生可用 JSON。")
 
-                    if llm_available():
-                        if st.button(t("ft_ai_fill"), key=f"ft_ai_btn_{pmid}"):
-                            proto: Protocol = st.session_state.get("protocol")
-                            schema_cols = [c.strip() for c in (st.session_state.get("extract_schema_text") or default_extraction_schema()).splitlines() if c.strip()]
-                            prompt = build_data_extraction_prompt(proto, schema_cols, full_text=ft_text)
-                            sys = "You are an evidence extraction assistant. Follow user instructions. Return JSON only."
-                            d = llm_json(sys, prompt, max_tokens=1500) or {}
-                            st.json(d)
+            st.markdown("</div>", unsafe_allow_html=True)
 
-                    st.markdown("</div>", unsafe_allow_html=True)
+            # Optional: quick list of all kept studies (no full-text widgets)
+            with st.expander("查看目前全文階段清單（不含全文輸入框）", expanded=False):
+                view = kept[["PMID","Year","First_author","Journal","Title"]].copy()
+                view["TA_Final"] = [final_ta(str(p)) for p in view["PMID"].astype(str)]
+                view["FT_decision"] = [st.session_state.get("ft_decision",{}).get(str(p),"Not reviewed") for p in view["PMID"].astype(str)]
+                st.dataframe(view, use_container_width=True, hide_index=True)
 
 # =========================================================
-# Tab 5: Step 5 Data extraction wide table (schema + quick add + editor)
+# Tab 5: Extraction wide table + editor
 # =========================================================
-REQUIRED_FOR_MA = ["OutcomeLabel","Effect_measure","Effect","Lower_CI","Upper_CI"]
-
-def build_extraction_df_from_schema(schema_cols: List[str]) -> pd.DataFrame:
-    df = st.session_state.get("extract_df")
-    df = ensure_columns(df, schema_cols, default="")
-    # Reorder columns to schema order (keep extras at end)
-    extras = [c for c in df.columns if c not in schema_cols]
-    return df[schema_cols + extras].copy()
-
-def validate_extraction(df: pd.DataFrame, chosen_measure: str, outcome_filter: str) -> pd.DataFrame:
-    """
-    Returns a per-row validation report.
-    """
-    if df is None or df.empty:
-        return pd.DataFrame()
-    work = df.copy()
-    work = ensure_columns(work, REQUIRED_FOR_MA, default="")
-    # outcome filter: substring match
-    outcome_filter = (outcome_filter or "").strip().lower()
-    if outcome_filter:
-        mask = work["OutcomeLabel"].astype(str).str.lower().str.contains(outcome_filter, na=False)
-        work = work[mask].copy()
-
-    # measure match
-    chosen_measure = (chosen_measure or "").strip()
-    if chosen_measure:
-        mask2 = work["Effect_measure"].astype(str).str.upper().str.strip() == chosen_measure.upper().strip()
-        work = work[mask2].copy()
-
-    if work.empty:
-        return pd.DataFrame()
-
-    rep = []
-    for idx, r in work.iterrows():
-        issues = []
-        for c in REQUIRED_FOR_MA:
-            if str(r.get(c,"")).strip() == "":
-                issues.append(f"Missing {c}")
-        # numeric checks
-        for c in ["Effect","Lower_CI","Upper_CI"]:
-            val = safe_float(r.get(c))
-            if val is None:
-                issues.append(f"Non-numeric {c}")
-        # ratio >0 checks
-        if chosen_measure.upper().strip() in RATIO_MEASURES:
-            for c in ["Effect","Lower_CI","Upper_CI"]:
-                val = safe_float(r.get(c))
-                if val is not None and val <= 0:
-                    issues.append(f"{c} must be >0 for {chosen_measure}")
-        rep.append({
-            "row_index": idx,
-            "PMID": r.get("PMID",""),
-            "First_author": r.get("First_author",""),
-            "Year": r.get("Year",""),
-            "Title": short(r.get("Title",""), 80),
-            "issues": "; ".join(issues) if issues else "",
-            "ok": (len(issues)==0),
-        })
-    return pd.DataFrame(rep)
 
 with tabs[5]:
+
     st.subheader(t("tabs_extract"))
 
     df = st.session_state.get("pubmed_records")
@@ -2523,6 +3044,7 @@ with tabs[5]:
 # =========================================================
 # Tab 6: Step 6 MA + Forest (button run; stable UI)
 # =========================================================
+
 with tabs[6]:
     st.subheader(t("tabs_ma"))
     df_ex = st.session_state.get("extract_df")
@@ -2530,52 +3052,45 @@ with tabs[6]:
         st.info("尚無 extraction 寬表。請先在 Step 5 建立/儲存。")
     else:
         df_ex = df_ex.copy()
-        df_ex = ensure_columns(df_ex, ["OutcomeLabel","Effect_measure","Effect","Lower_CI","Upper_CI","First_author","Year","Title","PMID"], default="")
-        outcome = st.text_input(t("ma_outcome_label"), key="ma_outcome_input", help="例如：'visual acuity'、'photic'、'defocus'。用 substring 匹配。")
+        df_ex = ensure_columns(df_ex, ["OutcomeLabel","Effect_measure","Effect","SE","Lower_CI","Upper_CI","First_author","Year","Title","PMID"], default="")
+
+        outcome = st.text_input(t("ma_outcome_label"), key="ma_outcome_input", help="用 substring 匹配 OutcomeLabel。留空=全選。")
         measure = st.selectbox(t("ma_measure"), options=["OR","RR","HR","MD","SMD"], key="ma_measure_choice")
-        model = st.selectbox("Model", options=["Fixed effect"], key="ma_model_choice")
-        st.caption("按鈕執行：避免你在 Step 5 輸入時反覆 rerun 造成消失或跳動。")
+        model = st.selectbox("Model", options=["Fixed effect", "Random effects (DL)"], key="ma_model_choice")
+
+        st.caption("按下 Run 之後才會執行（避免你在 Step 5 編輯時反覆 rerun）。")
 
         if st.button(t("ma_run"), type="primary"):
-            # Filter
             work = df_ex.copy()
-            if outcome.strip():
-                mask = work["OutcomeLabel"].astype(str).str.lower().str.contains(outcome.strip().lower(), na=False)
-                work = work[mask].copy()
-            mask2 = work["Effect_measure"].astype(str).str.upper().str.strip() == measure.upper().strip()
-            work = work[mask2].copy()
-
+            if outcome:
+                work = work[work["OutcomeLabel"].astype(str).str.lower().str.contains(outcome.lower(), na=False)]
+            work = work[work["Effect_measure"].astype(str).str.upper().str.contains(measure.upper(), na=False)]
             if work.empty:
-                st.warning("找不到符合 outcome + measure 的列。請回 Step 5 檢查 OutcomeLabel/Effect_measure。")
-                st.session_state["ma_last_result"] = None
+                st.error("沒有符合 OutcomeLabel/Effect_measure 的列。")
             else:
-                res, skipped = fixed_effect_meta(work, measure.upper().strip())
+                if model.startswith("Random"):
+                    res, skipped = random_effect_meta(work, measure.upper().strip())
+                else:
+                    res, skipped = fixed_effect_meta(work, measure.upper().strip())
+
                 st.session_state["ma_last_result"] = res
                 st.session_state["ma_skipped_rows"] = skipped
+
                 if res is None:
-                    st.error("沒有可用的列（可能 CI/Effect 不合法）。請看下方 skipped rows。")
+                    st.error("沒有可用的列（可能 CI/SE/Effect 不合法）。請看下方 skipped rows。")
                 else:
-                    st.success(f"Fixed-effect MA 完成：k={res['k']}；pooled={res['pooled']:.3g} (95% CI {res['pooled_lcl']:.3g}–{res['pooled_ucl']:.3g})")
-                    st.markdown("##### Forest plot")
-                    plot_forest(res, title=f"{outcome or 'Outcome'} ({measure}, fixed effect)")
+                    pooled = res["pooled"]; lcl = res["pooled_lcl"]; ucl = res["pooled_ucl"]
+                    st.success(f"{res['model']} 完成：k={res['k']}｜pooled={pooled:.3g} (95% CI {lcl:.3g}–{ucl:.3g})｜I²={res.get('I2',0):.1f}%")
+                    st.markdown("##### Forest plot（RevMan-like）")
+                    plot_forest(res, title=f"{outcome or 'Outcome'} ({measure}, {res['model']})")
                     st.markdown("##### Included rows")
                     st.dataframe(res["study_table"], use_container_width=True)
 
-            if isinstance(st.session_state.get("ma_skipped_rows"), pd.DataFrame) and not st.session_state["ma_skipped_rows"].empty:
-                st.markdown("##### Skipped rows (with reasons)")
-                st.dataframe(st.session_state["ma_skipped_rows"][["PMID","First_author","Year","Title","Effect","Lower_CI","Upper_CI","skip_reason"]].fillna(""), use_container_width=True)
-
-# =========================================================
-# Tab 7: ROB 2.0 (manual + optional AI)
-# =========================================================
-ROB_DOMAINS = [
-    "Randomization process",
-    "Deviations from intended interventions",
-    "Missing outcome data",
-    "Measurement of the outcome",
-    "Selection of the reported result",
-]
-ROB_LEVELS = ["Low", "Some concerns", "High", "Unclear"]
+        skipped = st.session_state.get("ma_skipped_rows")
+        if isinstance(skipped, pd.DataFrame) and not skipped.empty:
+            st.markdown("##### Skipped rows (with reasons)")
+            cols = [c for c in ["PMID","First_author","Year","OutcomeLabel","Effect_measure","Effect","Lower_CI","Upper_CI","SE","SkipReason"] if c in skipped.columns]
+            st.dataframe(skipped[cols], use_container_width=True)
 
 with tabs[7]:
     st.subheader(t("tabs_rob2"))
@@ -2586,6 +3101,24 @@ with tabs[7]:
         include_pmids = [pmid for pmid, dec in (st.session_state.get("ft_decision") or {}).items() if dec == "Include for meta-analysis"]
         if not include_pmids:
             st.warning("目前沒有 Full-text decision = Include for meta-analysis 的研究；ROB 2.0 通常在納入後做。你可先建立空白評分，或回 Step 4b 完成全文決策。")
+
+        with st.expander("ROB 2.0 traffic light（依目前已儲存的評分）", expanded=True):
+            rob_map = st.session_state.get("rob2", {}) or {}
+            pmids_plot = [str(p) for p in include_pmids[:30]] if include_pmids else []
+            if pmids_plot:
+                plot_rob2_traffic_light(rob_map, pmids_plot, title="RoB 2.0 traffic light (top 30)")
+            else:
+                st.info("尚未有納入研究可畫圖。")
+
+
+        with st.expander("ROB 2.0 traffic light（依目前已儲存的評分）", expanded=True):
+            rob_map = st.session_state.get("rob2", {}) or {}
+            pmids_plot = [str(p) for p in include_pmids[:30]] if include_pmids else []
+            if pmids_plot:
+                plot_rob2_traffic_light(rob_map, pmids_plot, title="RoB 2.0 traffic light (top 30)")
+            else:
+                st.info("尚未有納入研究可畫圖。")
+
 
         df = ensure_columns(df.copy(), ["PMID","Title","First_author","Year"], default="")
         for pmid in include_pmids[:50]:
