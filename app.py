@@ -2368,11 +2368,10 @@ with tabs[1]:
         st.markdown("---")
         st.markdown("### PRISMA（即時更新；會隨後續步驟 Include/Exclude 改變）")
         try:
-            prisma = compute_prisma()
+            prisma = compute_prisma(st.session_state.get("pubmed_records"))
             prisma_flow(prisma)
-        except Exception:
-            # avoid breaking UI if user is mid-edit
-            pass
+        except Exception as e:
+            st.warning(f"PRISMA 計算失敗：{e}")
 
 # =========================================================
 # Tab 2: Feasibility scan + recommendations
@@ -2925,17 +2924,27 @@ with tabs[5]:
             st.write(f"Selected: PMID={picked.get('PMID','')} | First author={picked.get('First_author','')} | Year={picked.get('Year','')}")
             # minimal fields
             # Core outcome/effect fields
-            out_label = st.text_input("OutcomeLabel", value=st.session_state.get("ma_outcome_input",""))
-            timepoint = st.text_input("Timepoint", value="")
-            eff_measure = st.selectbox("Effect_measure", options=["OR","RR","HR","MD","SMD"], index=0)
-            eff = st.text_input("Effect", value="")
-            se_val = st.text_input("SE (optional)", value="")
-            lcl = st.text_input("Lower_CI", value="")
-            ucl = st.text_input("Upper_CI", value="")
-            notes = st.text_area("Notes", value="", height=90)
+            with st.expander("欄位說明（中文）", expanded=False):
+                st.markdown(
+                    "- **OutcomeLabel（結局名稱）**：你要做統合分析的結局，如 UCVA、contrast sensitivity、adverse events\n"
+                    "- **Timepoint（時間點）**：該結局的量測時間，如 3 months、12 weeks\n"
+                    "- **Effect_measure（效應量類型）**：OR/RR/HR（比值型）、MD/SMD（連續型）\n"
+                    "- **Effect / 95% CI / SE**：可直接填作者報告的效應量與信賴區間；若只有 CI 也可以\n"
+                    "- **Arm-level data**：若你只有原始數據（Mean/SD/N 或 Events/Total），也可先填，之後再計算效應量\n"
+                    "- **Study characteristics**：投稿常見需要的研究基本資訊（設計、隨訪、資助等）"
+                )
 
-            with st.expander("Arm-level data (optional)"):
-                st.caption("Continuous outcomes (Mean/SD/N) — fill if you want the app to compute MD/SMD later.")
+            out_label = st.text_input("OutcomeLabel（結局名稱）", value=st.session_state.get("ma_outcome_input",""), help="例如：UCVA、contrast sensitivity、posterior capsular opacification、adverse events 等")
+            timepoint = st.text_input("Timepoint（時間點）", value="", help="例如：1 week / 3 months / 12 weeks / last follow-up")
+            eff_measure = st.selectbox("Effect_measure（效應量類型）", options=["OR","RR","HR","MD","SMD"], index=0, help="二元結局常用 OR/RR；時間到事件用 HR；連續結局常用 MD/SMD")
+            eff = st.text_input("Effect（效應量數值）", value="", help="請填入數值；OR/RR/HR 請填原尺度（非 log）")
+            se_val = st.text_input("SE（標準誤；可選）", value="", help="若你已有標準誤可直接填；沒有也可只填 95% CI")
+            lcl = st.text_input("Lower_CI（95% CI 下限）", value="", help="若有 95% 信賴區間請填入下限")
+            ucl = st.text_input("Upper_CI（95% CI 上限）", value="", help="若有 95% 信賴區間請填入上限")
+            notes = st.text_area("Notes（備註）", value="", height=90, help="可記錄量測方式、族群差異、轉換假設、作者回覆等")
+
+            with st.expander("Arm-level data（治療組/對照組原始數據；可選）"):
+                st.caption("連續型結局：填 Mean / SD / N（治療組與對照組）。若你還沒算 MD/SMD，之後可用這些原始數據自動計算。")
                 c1, c2 = st.columns(2)
                 with c1:
                     mean_t = st.text_input("Mean_Treat", value="")
@@ -2947,7 +2956,8 @@ with tabs[5]:
                     n_c = st.text_input("N_Control", value="")
 
                 st.divider()
-                st.caption("Dichotomous outcomes (Events/Total) — fill if you want the app to compute OR/RR later.")
+                st.caption("二元結局：填 Events / Total（治療組與對照組）。若你還沒算 OR/RR，之後可用這些原始數據自動計算。")
+                #he app to compute OR/RR later.")
                 d1, d2 = st.columns(2)
                 with d1:
                     ev_t = st.text_input("Events_Treat", value="")
@@ -2956,14 +2966,14 @@ with tabs[5]:
                     ev_c = st.text_input("Events_Control", value="")
                     tot_c = st.text_input("Total_Control", value="")
 
-            with st.expander("Study characteristics (optional)"):
-                study_design = st.text_input("StudyDesign", value="")
-                setting = st.text_input("Setting", value="")
-                country = st.text_input("Country", value="")
-                followup = st.text_input("FollowUp", value="")
-                funding = st.text_input("Funding", value="")
-                registration = st.text_input("Registration", value="")
-                outcome_def = st.text_area("OutcomeDefinition", value="", height=70)
+            with st.expander("Study characteristics（研究特徵；可選但建議）"):
+                study_design = st.text_input("StudyDesign（研究設計）", value="", help="例如：RCT / cluster RCT / crossover / cohort")
+                setting = st.text_input("Setting（場域/中心）", value="", help="例如：single-center / multi-center / outpatient / community")
+                country = st.text_input("Country（國家/地區）", value="", help="例如：Netherlands / Taiwan / multicountry")
+                follow_up = st.text_input("FollowUp（隨訪時間）", value="", help="例如：3 months / 12 weeks / 1 year")
+                funding = st.text_input("Funding（經費/贊助）", value="", help="例如：industry-funded / government / none declared")
+                registration = st.text_input("Registration（註冊/登錄）", value="", help="例如：ClinicalTrials.gov NCTxxxx / PROSPERO / NA")
+                outcome_def = st.text_area("OutcomeDefinition（結局定義/量測方式）", value="", height=70, help="例如：以 logMAR 測量、特定量表、事件判定標準等")
 
             submitted = st.form_submit_button("Append row")
 
