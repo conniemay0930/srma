@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import io
+import textwrap
 import re
 import math
 import json
@@ -1543,6 +1544,110 @@ def se_from_ci(effect: float, lcl: float, ucl: float, measure: str) -> Optional[
     # continuous
     return (ucl - lcl) / 3.92 if ucl is not None and lcl is not None else None
 
+
+
+def derive_effect_ci_from_arm(row: dict, measure: str) -> Optional[Tuple[float, float, float]]:
+    """Derive Effect and 95% CI from arm-level data if Effect/CI are missing.
+
+    Supported measures:
+    - OR, RR: needs Events_Treat/Total_Treat and Events_Control/Total_Control
+    - MD, SMD: needs Mean/SD/N for Treat and Control
+
+    Returns (effect, lcl, ucl) or None if insufficient data.
+    """
+    m = (measure or "").upper().strip()
+    z = 1.96
+
+    def _ok(*vals):
+        return all(v is not None and math.isfinite(v) for v in vals)
+
+    if m in ("OR", "RR"):
+        a = safe_float(row.get("Events_Treat"))
+        n1 = safe_float(row.get("Total_Treat"))
+        c = safe_float(row.get("Events_Control"))
+        n0 = safe_float(row.get("Total_Control"))
+        if not _ok(a, n1, c, n0):
+            return None
+        if n1 <= 0 or n0 <= 0:
+            return None
+        b = n1 - a
+        d = n0 - c
+        # Basic sanity
+        if b < 0 or d < 0 or a < 0 or c < 0:
+            return None
+        # continuity correction if any cell is zero
+        if a == 0 or b == 0 or c == 0 or d == 0:
+            a += 0.5
+            b += 0.5
+            c += 0.5
+            d += 0.5
+            n1 = a + b
+            n0 = c + d
+
+        if m == "OR":
+            eff = (a * d) / (b * c) if (b * c) != 0 else None
+            if eff is None or eff <= 0:
+                return None
+            se = math.sqrt((1.0 / a) + (1.0 / b) + (1.0 / c) + (1.0 / d))
+            lcl = math.exp(math.log(eff) - z * se)
+            ucl = math.exp(math.log(eff) + z * se)
+            return float(eff), float(lcl), float(ucl)
+
+        # RR
+        if a <= 0 or c <= 0:
+            # after correction, these should be >0; if not, cannot compute RR SE
+            return None
+        risk_t = a / n1
+        risk_c = c / n0
+        if risk_t <= 0 or risk_c <= 0:
+            return None
+        eff = risk_t / risk_c
+        if eff <= 0:
+            return None
+        se = math.sqrt((1.0 / a) - (1.0 / n1) + (1.0 / c) - (1.0 / n0))
+        lcl = math.exp(math.log(eff) - z * se)
+        ucl = math.exp(math.log(eff) + z * se)
+        return float(eff), float(lcl), float(ucl)
+
+    if m in ("MD", "SMD"):
+        mt = safe_float(row.get("Mean_Treat"))
+        sdt = safe_float(row.get("SD_Treat"))
+        nt = safe_float(row.get("N_Treat"))
+        mc = safe_float(row.get("Mean_Control"))
+        sdc = safe_float(row.get("SD_Control"))
+        nc = safe_float(row.get("N_Control"))
+        if not _ok(mt, sdt, nt, mc, sdc, nc):
+            return None
+        if nt <= 0 or nc <= 0 or sdt < 0 or sdc < 0:
+            return None
+
+        if m == "MD":
+            eff = mt - mc
+            se = math.sqrt((sdt * sdt) / nt + (sdc * sdc) / nc)
+            if not math.isfinite(se) or se <= 0:
+                return None
+            lcl = eff - z * se
+            ucl = eff + z * se
+            return float(eff), float(lcl), float(ucl)
+
+        # SMD (Hedges g)
+        if nt + nc - 2 <= 0:
+            return None
+        sp2 = (((nt - 1.0) * (sdt * sdt)) + ((nc - 1.0) * (sdc * sdc))) / (nt + nc - 2.0)
+        if sp2 <= 0:
+            return None
+        sp = math.sqrt(sp2)
+        d = (mt - mc) / sp
+        J = 1.0 - (3.0 / (4.0 * (nt + nc) - 9.0)) if (4.0 * (nt + nc) - 9.0) != 0 else 1.0
+        g = J * d
+        se = math.sqrt(((nt + nc) / (nt * nc)) + (g * g) / (2.0 * (nt + nc - 2.0)))
+        if not math.isfinite(se) or se <= 0:
+            return None
+        lcl = g - z * se
+        ucl = g + z * se
+        return float(g), float(lcl), float(ucl)
+
+    return None
 def fixed_effect_meta(df: pd.DataFrame, measure: str) -> Tuple[Optional[dict], pd.DataFrame]:
     """
     Fixed-effect meta-analysis.
@@ -1552,7 +1657,7 @@ def fixed_effect_meta(df: pd.DataFrame, measure: str) -> Tuple[Optional[dict], p
     Adds heterogeneity statistics (Q, df, I2) for transparency.
     """
     work = df.copy()
-    work = ensure_columns(work, ["Effect","Lower_CI","Upper_CI","StudyID","First_author","Year","Title"], default="")
+    work = ensure_columns(work, ["Effect","Lower_CI","Upper_CI","StudyID","First_author","Year","Title","Events_Treat","Total_Treat","Events_Control","Total_Control","Mean_Treat","SD_Treat","N_Treat","Mean_Control","SD_Control","N_Control"], default="")
     for c in ["Effect","Lower_CI","Upper_CI"]:
         work[c] = pd.to_numeric(work[c], errors="coerce")
 
@@ -1561,8 +1666,12 @@ def fixed_effect_meta(df: pd.DataFrame, measure: str) -> Tuple[Optional[dict], p
     for _, r in work.iterrows():
         eff = r.get("Effect"); lcl = r.get("Lower_CI"); ucl = r.get("Upper_CI")
         if pd.isna(eff) or pd.isna(lcl) or pd.isna(ucl):
-            skipped.append({**r.to_dict(), "skip_reason": "Missing Effect/CI"})
-            continue
+            derived = derive_effect_ci_from_arm(r.to_dict(), measure)
+            if derived is None:
+                skipped.append({**r.to_dict(), "skip_reason": "Missing Effect/CI (and cannot derive from arm-level)"})
+                continue
+            eff, lcl, ucl = derived
+            r["Effect"], r["Lower_CI"], r["Upper_CI"] = eff, lcl, ucl
         eff = float(eff); lcl = float(lcl); ucl = float(ucl)
         se = se_from_ci(eff, lcl, ucl, measure)
         if se is None or se <= 0 or (not math.isfinite(se)):
@@ -1641,7 +1750,7 @@ def random_effect_meta(df: pd.DataFrame, measure: str, method: str = "DL") -> Tu
     - Heterogeneity: Q, I2, tau^2 are returned (when k>=2).
     """
     work = df.copy()
-    work = ensure_columns(work, ["Effect","Lower_CI","Upper_CI","StudyID","First_author","Year","Title"], default="")
+    work = ensure_columns(work, ["Effect","Lower_CI","Upper_CI","StudyID","First_author","Year","Title","Events_Treat","Total_Treat","Events_Control","Total_Control","Mean_Treat","SD_Treat","N_Treat","Mean_Control","SD_Control","N_Control"], default="")
     for c in ["Effect","Lower_CI","Upper_CI"]:
         work[c] = pd.to_numeric(work[c], errors="coerce")
 
@@ -1650,8 +1759,12 @@ def random_effect_meta(df: pd.DataFrame, measure: str, method: str = "DL") -> Tu
     for _, r in work.iterrows():
         eff = r.get("Effect"); lcl = r.get("Lower_CI"); ucl = r.get("Upper_CI")
         if pd.isna(eff) or pd.isna(lcl) or pd.isna(ucl):
-            skipped.append({**r.to_dict(), "skip_reason": "Missing Effect/CI"})
-            continue
+            derived = derive_effect_ci_from_arm(r.to_dict(), measure)
+            if derived is None:
+                skipped.append({**r.to_dict(), "skip_reason": "Missing Effect/CI (and cannot derive from arm-level)"})
+                continue
+            eff, lcl, ucl = derived
+            r["Effect"], r["Lower_CI"], r["Upper_CI"] = eff, lcl, ucl
         eff = float(eff); lcl = float(lcl); ucl = float(ucl)
         se = se_from_ci(eff, lcl, ucl, measure)
         if se is None or se <= 0 or (not math.isfinite(se)):
@@ -1807,9 +1920,10 @@ def plot_rob2_traffic_light(rob2_map: Dict[str, dict], df_records: pd.DataFrame,
     for p in pmids:
         rr = df_records[df_records["PMID"].astype(str) == str(p)]
         if rr.empty:
-            label_map[p] = p
+            label = str(p)
         else:
-            label_map[p] = f"{rr['First_author'].iloc[0]} {rr['Year'].iloc[0]}".strip() or p
+            label = f"{rr['First_author'].iloc[0]} {rr['Year'].iloc[0]}".strip() or str(p)
+        label_map[p] = textwrap.fill(str(label), width=18)
 
     domains = ROB_DOMAINS + ["Overall"]
     levels = []
@@ -1844,7 +1958,7 @@ def plot_rob2_traffic_light(rob2_map: Dict[str, dict], df_records: pd.DataFrame,
     ax.axis("off")
 
     table_data = [[label_map[p]] + levels[i] for i, p in enumerate(pmids)]
-    col_labels = ["Study"] + domains
+    col_labels = ["Study"] + [textwrap.fill(str(d), width=14) for d in domains]
 
     tbl = ax.table(
         cellText=table_data,
@@ -1854,7 +1968,8 @@ def plot_rob2_traffic_light(rob2_map: Dict[str, dict], df_records: pd.DataFrame,
         loc="upper left",
     )
     tbl.auto_set_font_size(False)
-    tbl.set_fontsize(9)
+    tbl.set_fontsize(8)
+    tbl.scale(1.2, 1.4)
 
     # color cells
     for i in range(len(pmids)):
@@ -1870,6 +1985,73 @@ def plot_rob2_traffic_light(rob2_map: Dict[str, dict], df_records: pd.DataFrame,
         cell.set_text_props(weight="bold")
 
     st.pyplot(fig, use_container_width=True)
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=200, bbox_inches="tight")
+    png_bytes = buf.getvalue()
+    return fig, png_bytes
+
+
+def make_rob2_docx(png_bytes: bytes, rob2_map: Dict[str, dict], pmids: List[str], df_records: pd.DataFrame) -> bytes:
+    """Create a Word document containing the RoB 2.0 traffic-light image and a rationale table."""
+    from docx import Document
+    from docx.shared import Inches
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+    doc = Document()
+    doc.add_heading('Risk of Bias 2.0 (RoB 2.0)', level=1)
+    p = doc.add_paragraph('Traffic light summary')
+    p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+
+    # add image
+    img_stream = io.BytesIO(png_bytes)
+    doc.add_picture(img_stream, width=Inches(6.5))
+
+    doc.add_paragraph(' ')
+    doc.add_heading('Per-study judgments and rationale', level=2)
+
+    df_records = ensure_columns(df_records.copy(), ["PMID","First_author","Year","Title"], default="")
+    domains = ROB_DOMAINS + ["Overall"]
+    table = doc.add_table(rows=1, cols=4 + len(domains))
+    hdr = table.rows[0].cells
+    hdr[0].text = 'PMID'
+    hdr[1].text = 'Study'
+    hdr[2].text = 'Year'
+    hdr[3].text = 'Title'
+    for j, d in enumerate(domains):
+        hdr[4+j].text = d
+
+    for p in [str(x) for x in pmids]:
+        r = rob2_map.get(str(p), {}) or {}
+        rec = df_records[df_records['PMID'].astype(str) == str(p)]
+        study = p
+        year = ''
+        title = ''
+        if not rec.empty:
+            study = f"{rec['First_author'].iloc[0]}".strip() or p
+            year = str(rec['Year'].iloc[0] or '')
+            title = str(rec['Title'].iloc[0] or '')
+        row = table.add_row().cells
+        row[0].text = str(p)
+        row[1].text = study
+        row[2].text = year
+        row[3].text = title
+        for j, d in enumerate(domains):
+            row[4+j].text = str(r.get(d, ''))
+
+    # rationale as separate section to avoid table overflow
+    doc.add_page_break()
+    doc.add_heading('Rationale (text)', level=2)
+    for p in [str(x) for x in pmids]:
+        r = rob2_map.get(str(p), {}) or {}
+        doc.add_heading(f"PMID {p}", level=3)
+        rat = str(r.get('Rationale','') or '').strip()
+        doc.add_paragraph(rat if rat else '(no rationale)')
+
+    out = io.BytesIO()
+    doc.save(out)
+    return out.getvalue()
+
 
 # =========================================================
 # Manuscript draft
@@ -2803,7 +2985,7 @@ def validate_extraction(df: pd.DataFrame, chosen_measure: str, outcome_filter: s
     if df is None or df.empty:
         return pd.DataFrame()
     work = df.copy()
-    work = ensure_columns(work, REQUIRED_FOR_MA, default="")
+    work = ensure_columns(work, REQUIRED_FOR_MA + ["Events_Treat","Total_Treat","Events_Control","Total_Control","Mean_Treat","SD_Treat","N_Treat","Mean_Control","SD_Control","N_Control"], default="")
     # outcome filter: substring match
     outcome_filter = (outcome_filter or "").strip().lower()
     if outcome_filter:
@@ -2822,6 +3004,16 @@ def validate_extraction(df: pd.DataFrame, chosen_measure: str, outcome_filter: s
     rep = []
     for idx, r in work.iterrows():
         issues = []
+
+        # Allow auto-derivation from arm-level data for common measures
+        derived = None
+        if (str(r.get("Effect","")).strip()=="" or str(r.get("Lower_CI","")).strip()=="" or str(r.get("Upper_CI","")).strip()==""):
+            derived = derive_effect_ci_from_arm(r.to_dict(), chosen_measure)
+            if derived is not None:
+                # pretend Effect/CI present for validation
+                eff_d, lcl_d, ucl_d = derived
+                r = r.copy()
+                r["Effect"], r["Lower_CI"], r["Upper_CI"] = eff_d, lcl_d, ucl_d
         for c in REQUIRED_FOR_MA:
             if str(r.get(c,"")).strip() == "":
                 issues.append(f"Missing {c}")
@@ -3225,9 +3417,40 @@ with tabs[7]:
     pmids_for_plot = [str(p) for p in pmids_for_plot if str(p) in rob_map]
     picked_plot = st.multiselect("選擇要畫的研究（最多 30）", options=pmids_for_plot, default=pmids_for_plot[: min(10, len(pmids_for_plot))], key="rob2_plot_pick")
     if st.button("畫 ROB 2.0 圖", key="rob2_plot_btn"):
-        plot_rob2_traffic_light(rob_map, df, picked_plot, max_n=30)
+        fig, png_bytes = plot_rob2_traffic_light(rob_map, df, picked_plot, max_n=30)
+        if png_bytes:
+            st.session_state["rob2_plot_png"] = png_bytes
+            st.download_button(
+                "匯出 ROB 2.0 圖（PNG）",
+                data=png_bytes,
+                file_name="rob2_traffic_light.png",
+                mime="image/png",
+                key="dl_rob2_png",
+            )
+            try:
+                doc_bytes = make_rob2_docx(png_bytes, rob_map, picked_plot, df)
+                st.download_button(
+                    "匯出 ROB 2.0（Word）",
+                    data=doc_bytes,
+                    file_name="rob2_traffic_light.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    key="dl_rob2_docx",
+                )
+            except Exception:
+                st.warning("Word 匯出失敗（環境可能缺少 docx 相依套件）。")
 
-    with st.expander("ROB 2.0（含理由）表格", expanded=False):
+    
+    # 若已產生圖（不需再按一次），也提供匯出
+    if st.session_state.get("rob2_plot_png"):
+        st.download_button(
+            "匯出 ROB 2.0 圖（PNG）",
+            data=st.session_state["rob2_plot_png"],
+            file_name="rob2_traffic_light.png",
+            mime="image/png",
+            key="dl_rob2_png2",
+        )
+
+with st.expander("ROB 2.0（含理由）表格", expanded=False):
         rows = []
         for p in pmids_for_plot:
             r = rob_map.get(str(p), {}) or {}
