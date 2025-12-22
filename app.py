@@ -2924,12 +2924,47 @@ with tabs[5]:
             picked = pmid_to_row.get(pick, {})
             st.write(f"Selected: PMID={picked.get('PMID','')} | First author={picked.get('First_author','')} | Year={picked.get('Year','')}")
             # minimal fields
+            # Core outcome/effect fields
             out_label = st.text_input("OutcomeLabel", value=st.session_state.get("ma_outcome_input",""))
+            timepoint = st.text_input("Timepoint", value="")
             eff_measure = st.selectbox("Effect_measure", options=["OR","RR","HR","MD","SMD"], index=0)
             eff = st.text_input("Effect", value="")
+            se_val = st.text_input("SE (optional)", value="")
             lcl = st.text_input("Lower_CI", value="")
             ucl = st.text_input("Upper_CI", value="")
-            notes = st.text_input("Notes", value="")
+            notes = st.text_area("Notes", value="", height=90)
+
+            with st.expander("Arm-level data (optional)"):
+                st.caption("Continuous outcomes (Mean/SD/N) — fill if you want the app to compute MD/SMD later.")
+                c1, c2 = st.columns(2)
+                with c1:
+                    mean_t = st.text_input("Mean_Treat", value="")
+                    sd_t = st.text_input("SD_Treat", value="")
+                    n_t = st.text_input("N_Treat", value="")
+                with c2:
+                    mean_c = st.text_input("Mean_Control", value="")
+                    sd_c = st.text_input("SD_Control", value="")
+                    n_c = st.text_input("N_Control", value="")
+
+                st.divider()
+                st.caption("Dichotomous outcomes (Events/Total) — fill if you want the app to compute OR/RR later.")
+                d1, d2 = st.columns(2)
+                with d1:
+                    ev_t = st.text_input("Events_Treat", value="")
+                    tot_t = st.text_input("Total_Treat", value="")
+                with d2:
+                    ev_c = st.text_input("Events_Control", value="")
+                    tot_c = st.text_input("Total_Control", value="")
+
+            with st.expander("Study characteristics (optional)"):
+                study_design = st.text_input("StudyDesign", value="")
+                setting = st.text_input("Setting", value="")
+                country = st.text_input("Country", value="")
+                followup = st.text_input("FollowUp", value="")
+                funding = st.text_input("Funding", value="")
+                registration = st.text_input("Registration", value="")
+                outcome_def = st.text_area("OutcomeDefinition", value="", height=70)
+
             submitted = st.form_submit_button("Append row")
 
         if submitted and options:
